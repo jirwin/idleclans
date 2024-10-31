@@ -21,6 +21,7 @@ func (p *plugin) Load(ctx context.Context) []bot.Option {
 	opts := []bot.Option{
 		bot.WithMessageHandler(p.priceCmd(ctx)),
 		bot.WithMessageHandler(p.pvmCmd(ctx)),
+		bot.WithMessageHandler(p.playerCmd(ctx)),
 	}
 
 	return opts

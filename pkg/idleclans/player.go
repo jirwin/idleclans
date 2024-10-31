@@ -2,8 +2,24 @@ package idleclans
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"log"
 	"path"
+
+	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
+	"go.uber.org/zap"
 )
+
+type SimplePlayer struct {
+	SkillExperiencesStr string             `json:"skillExperiences"`
+	Skills              map[string]float64 `json:"-"`
+	EquipmentStr        string             `json:"equipment"`
+	Equipment           []int              `json:"-"`
+	HoursOffline        float64            `json:"hoursOffline"`
+	TaskTypeOnLogout    int                `json:"taskTypeOnLogout"`
+	TaskNameOnLogout    string             `json:"taskNameOnLogout"`
+}
 
 type Player struct {
 	Username         string `json:"username"`
@@ -163,6 +179,45 @@ func (c *Client) GetPlayer(ctx context.Context, playerName string) (*Player, err
 	_, err = c.doReq(ctx, req, ret)
 	if err != nil {
 		return nil, err
+	}
+
+	return ret, nil
+}
+
+// GetSimplePlayer Retrieves a simplified profile for a specific player.
+// https://query.idleclans.com/api/Player/profile/simple/{name}
+func (c *Client) GetSimplePlayer(ctx context.Context, playerName string) (*SimplePlayer, error) {
+	u, err := c.getBaseURL()
+	if err != nil {
+		return nil, err
+	}
+
+	u.Path = path.Join(u.Path, "Player/profile/simple", playerName)
+
+	fmt.Println(u.String())
+	req, err := c.getReq(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	ret := &SimplePlayer{
+		Skills: make(map[string]float64),
+	}
+
+	ctxzap.Extract(ctx).Info("Requesting player profile", zap.String("url", u.String()))
+	_, err = c.doReq(ctx, req, ret)
+	if err != nil {
+		return nil, err
+	}
+
+	err = json.Unmarshal([]byte(ret.SkillExperiencesStr), &ret.Skills)
+	if err != nil {
+		log.Fatalf("Error unmarshalling skill experiences: %v", err)
+	}
+
+	err = json.Unmarshal([]byte(ret.EquipmentStr), &ret.Equipment)
+	if err != nil {
+		log.Fatalf("Error unmarshalling equipment: %v", err)
 	}
 
 	return ret, nil
