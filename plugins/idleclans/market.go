@@ -68,6 +68,12 @@ func (p *plugin) webhookHandler(ctx context.Context) bot.WebhookHandler {
 		action := strings.TrimPrefix(c.Request.URL.Path, "/webhook/idleclans")
 
 		switch action {
+		case "", "/":
+			// Base path - return available actions
+			c.JSON(200, gin.H{
+				"available_actions": []string{"price", "pvm"},
+				"usage":             "Use /webhook/idleclans/price or /webhook/idleclans/pvm",
+			})
 		case "/price":
 			p.handlePriceWebhook(ctx, s, c, channelID)
 		case "/pvm":

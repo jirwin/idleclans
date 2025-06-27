@@ -74,7 +74,11 @@ func (b *Bot) startWebhookServer(port string) {
 	// Add webhook routes
 	b.mu.RLock()
 	for pathPrefix, handler := range b.webhookHandlers {
+		// Register both with and without trailing slash to avoid 301 redirects
 		router.Any(pathPrefix+"/*path", func(c *gin.Context) {
+			b.handleWebhook(c, handler)
+		})
+		router.Any(pathPrefix, func(c *gin.Context) {
 			b.handleWebhook(c, handler)
 		})
 	}
