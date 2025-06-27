@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"path"
 	"syscall"
 
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
@@ -20,13 +21,37 @@ func initLogging(ctx context.Context) context.Context {
 	return ctxzap.ToContext(ctx, l)
 }
 
+// getDiscordToken retrieves the Discord token from systemd credentials first,
+// then falls back to environment variable
+func getDiscordToken() string {
+	// Check for systemd credential first
+	if credsDir := os.Getenv("CREDENTIALS_DIRECTORY"); credsDir != "" {
+		if tokenBytes, err := os.ReadFile(path.Join(credsDir, "discord_token")); err == nil {
+			// Remove trailing newline if present
+			token := string(tokenBytes)
+			if len(token) > 0 && token[len(token)-1] == '\n' {
+				token = token[:len(token)-1]
+			}
+			return token
+		}
+	}
+
+	// Fall back to environment variable
+	return os.Getenv("DISCORD_TOKEN")
+}
+
 func main() {
 	ctx := context.Background()
 
 	ctx = initLogging(ctx)
 	l := ctxzap.Extract(ctx)
 
-	discordToken := os.Getenv("DISCORD_TOKEN")
+	discordToken := getDiscordToken()
+	if discordToken == "" {
+		l.Error("No Discord token found. Please set either systemd credential 'discord_token' or DISCORD_TOKEN environment variable")
+		os.Exit(1)
+	}
+
 	b, err := bot.New(discordToken)
 	if err != nil {
 		l.Error("Error creating bot,", zap.Error(err))
