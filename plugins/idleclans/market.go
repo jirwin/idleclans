@@ -51,43 +51,41 @@ func (p *plugin) priceCmd(ctx context.Context) bot.MessageHandler {
 	}
 }
 
-func (p *plugin) webhookHandler(ctx context.Context) bot.WebhookHandler {
-	return func(s *discordgo.Session, c *gin.Context) {
-		l := ctxzap.Extract(ctx)
-		l.Info("Processing webhook", zap.String("path", c.Request.URL.Path))
-		// Extract channel ID from query parameter or header
-		channelID := c.Query("channel_id")
-		if channelID == "" {
-			channelID = c.GetHeader("X-Discord-Channel-ID")
-		}
-
-		if channelID == "" {
-			c.JSON(400, gin.H{"error": "channel_id is required"})
-			return
-		}
-
-		// Handle different webhook actions based on path
-		action := strings.TrimPrefix(c.Request.URL.Path, "/webhook/idleclans")
-
-		switch action {
-		case "", "/":
-			// Base path - return available actions
+func (p *plugin) setupWebhookRoutes(ctx context.Context) bot.WebhookRouterSetup {
+	return func(router *gin.RouterGroup, s *discordgo.Session) {
+		// Base route - show available actions
+		router.GET("", func(c *gin.Context) {
 			c.JSON(200, gin.H{
 				"available_actions": []string{"price", "pvm"},
-				"usage":             "Use /webhook/idleclans/price or /webhook/idleclans/pvm",
+				"usage":             "Use POST /webhook/idleclans/price or POST /webhook/idleclans/pvm",
 			})
-		case "/price":
-			p.handlePriceWebhook(ctx, s, c, channelID)
-		case "/pvm":
-			p.handlePvmWebhook(ctx, s, c, channelID)
-		default:
-			c.JSON(404, gin.H{"error": "unknown action"})
-		}
+		})
+
+		// Price webhook route
+		router.POST("/price", func(c *gin.Context) {
+			p.handlePriceWebhook(ctx, s, c)
+		})
+
+		// PVM webhook route
+		router.POST("/pvm", func(c *gin.Context) {
+			p.handlePvmWebhook(ctx, s, c)
+		})
 	}
 }
 
-func (p *plugin) handlePriceWebhook(ctx context.Context, s *discordgo.Session, c *gin.Context, channelID string) {
+func (p *plugin) handlePriceWebhook(ctx context.Context, s *discordgo.Session, c *gin.Context) {
 	l := ctxzap.Extract(ctx)
+
+	// Extract channel ID from query parameter or header
+	channelID := c.Query("channel_id")
+	if channelID == "" {
+		channelID = c.GetHeader("X-Discord-Channel-ID")
+	}
+
+	if channelID == "" {
+		c.JSON(400, gin.H{"error": "channel_id is required"})
+		return
+	}
 
 	var req struct {
 		ItemID string `json:"item_id" binding:"required"`
@@ -126,8 +124,19 @@ func (p *plugin) handlePriceWebhook(ctx context.Context, s *discordgo.Session, c
 	c.JSON(200, gin.H{"status": "message sent", "price": price})
 }
 
-func (p *plugin) handlePvmWebhook(ctx context.Context, s *discordgo.Session, c *gin.Context, channelID string) {
+func (p *plugin) handlePvmWebhook(ctx context.Context, s *discordgo.Session, c *gin.Context) {
 	l := ctxzap.Extract(ctx)
+
+	// Extract channel ID from query parameter or header
+	channelID := c.Query("channel_id")
+	if channelID == "" {
+		channelID = c.GetHeader("X-Discord-Channel-ID")
+	}
+
+	if channelID == "" {
+		c.JSON(400, gin.H{"error": "channel_id is required"})
+		return
+	}
 
 	var req struct {
 		PlayerName string `json:"player_name" binding:"required"`

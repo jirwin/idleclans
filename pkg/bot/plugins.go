@@ -35,10 +35,10 @@ func WithMessageHandler(handler func(*discordgo.Session, *discordgo.MessageCreat
 	}
 }
 
-type WebhookHandler func(*discordgo.Session, *gin.Context)
+type WebhookRouterSetup func(*gin.RouterGroup, *discordgo.Session)
 
-func WithWebhookHandler(pathPrefix string, handler WebhookHandler) Option {
+func WithWebhookRouter(pathPrefix string, setup WebhookRouterSetup) Option {
 	return func(b *Bot) {
-		b.RegisterWebhookHandler(pathPrefix, handler)
+		b.RegisterWebhookRouter(pathPrefix, setup)
 	}
 }

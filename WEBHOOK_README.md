@@ -10,49 +10,55 @@ Set the `WEBHOOK_PORT` environment variable to enable webhook support:
 export WEBHOOK_PORT=8080
 ```
 
-## Plugin Webhook Handlers
+## Plugin Webhook Routers
 
-Plugins can register webhook handlers in their `Load()` method:
+Plugins can register webhook routers in their `Load()` method:
 
 ```go
 func (p *plugin) Load(ctx context.Context) []bot.Option {
     opts := []bot.Option{
         bot.WithMessageHandler(p.someMessageHandler(ctx)),
-        bot.WithWebhookHandler("/webhook/myplugin", p.webhookHandler(ctx)),
+        bot.WithWebhookRouter("/webhook/myplugin", p.setupWebhookRoutes(ctx)),
     }
     return opts
 }
 ```
 
-## Webhook Handler Implementation
+## Webhook Router Setup
 
-Webhook handlers receive a Discord session and Gin context:
+Plugins define a router setup function that receives a Gin router group and Discord session:
 
 ```go
-func (p *plugin) webhookHandler(ctx context.Context) bot.WebhookHandler {
-    return func(s *discordgo.Session, c *gin.Context) {
-        // Extract channel ID from query parameter or header
-        channelID := c.Query("channel_id")
-        if channelID == "" {
-            channelID = c.GetHeader("X-Discord-Channel-ID")
-        }
-
-        if channelID == "" {
-            c.JSON(400, gin.H{"error": "channel_id is required"})
-            return
-        }
-
-        // Handle the webhook request
-        // Send message to Discord
-        s.ChannelMessageSend(channelID, "Hello from webhook!")
+func (p *plugin) setupWebhookRoutes(ctx context.Context) bot.WebhookRouterSetup {
+    return func(router *gin.RouterGroup, s *discordgo.Session) {
+        // Define your routes here
+        router.GET("", func(c *gin.Context) {
+            c.JSON(200, gin.H{"message": "Hello from webhook!"})
+        })
         
-        // Return response
-        c.JSON(200, gin.H{"status": "success"})
+        router.POST("/action", func(c *gin.Context) {
+            // Extract channel ID
+            channelID := c.GetHeader("X-Discord-Channel-ID")
+            if channelID == "" {
+                c.JSON(400, gin.H{"error": "channel_id required"})
+                return
+            }
+            
+            // Send message to Discord
+            s.ChannelMessageSend(channelID, "Webhook triggered!")
+            c.JSON(200, gin.H{"status": "success"})
+        })
     }
 }
 ```
 
 ## Example Usage
+
+### Get Available Actions
+
+```bash
+curl http://localhost:8080/webhook/idleclans
+```
 
 ### Price Webhook
 
@@ -78,13 +84,58 @@ curl -X POST http://localhost:8080/webhook/idleclans/pvm \
 
 ## Features
 
-- **Concurrent Processing**: Webhook handlers run concurrently in goroutines
-- **Path Prefix Matching**: Routes are matched by path prefix
+- **Router-Based**: Plugins have full control over their HTTP routing using Gin
 - **Discord Integration**: Full access to Discord session for sending messages
+- **Flexible Routing**: Use any HTTP method, middleware, or Gin features
 - **Logging**: All webhook requests are logged with structured logging
-- **Error Handling**: Panic recovery and proper error responses
+- **Error Handling**: Proper error responses and panic recovery
 - **404 Handling**: Unmatched routes return 404
 - **Graceful Shutdown**: Webhook server shuts down properly with the bot
+
+## Adding New Webhook Routes
+
+To add webhook routes to a plugin:
+
+1. Create a `setupWebhookRoutes` function that returns a `bot.WebhookRouterSetup`
+2. Register it in the plugin's `Load()` method using `bot.WithWebhookRouter()`
+3. Define your routes on the provided router group
+4. Use the Discord session to send messages
+
+Example:
+
+```go
+func (p *plugin) setupWebhookRoutes(ctx context.Context) bot.WebhookRouterSetup {
+    return func(router *gin.RouterGroup, s *discordgo.Session) {
+        // Base route
+        router.GET("", func(c *gin.Context) {
+            c.JSON(200, gin.H{"status": "plugin ready"})
+        })
+        
+        // Custom action route
+        router.POST("/custom", func(c *gin.Context) {
+            channelID := c.GetHeader("X-Discord-Channel-ID")
+            if channelID == "" {
+                c.JSON(400, gin.H{"error": "channel_id required"})
+                return
+            }
+            
+            // Your custom logic here
+            s.ChannelMessageSend(channelID, "Custom webhook action!")
+            c.JSON(200, gin.H{"status": "success"})
+        })
+        
+        // You can add middleware, sub-routes, etc.
+        admin := router.Group("/admin")
+        admin.Use(func(c *gin.Context) {
+            // Admin authentication middleware
+            c.Next()
+        })
+        admin.POST("/action", func(c *gin.Context) {
+            // Admin-only action
+        })
+    }
+}
+```
 
 ## Security Considerations
 
@@ -92,30 +143,4 @@ curl -X POST http://localhost:8080/webhook/idleclans/pvm \
 - Consider adding authentication (API keys, tokens) for production use
 - Validate channel IDs to ensure messages are sent to intended channels
 - Rate limiting may be needed for high-traffic scenarios
-
-## Adding New Webhook Handlers
-
-To add a new webhook handler to a plugin:
-
-1. Create a handler function that implements `bot.WebhookHandler`
-2. Register it in the plugin's `Load()` method using `bot.WithWebhookHandler()`
-3. Handle the request and send appropriate Discord messages
-4. Return proper HTTP responses
-
-Example:
-
-```go
-func (p *plugin) myWebhookHandler(ctx context.Context) bot.WebhookHandler {
-    return func(s *discordgo.Session, c *gin.Context) {
-        channelID := c.GetHeader("X-Discord-Channel-ID")
-        if channelID == "" {
-            c.JSON(400, gin.H{"error": "channel_id required"})
-            return
-        }
-
-        // Your webhook logic here
-        s.ChannelMessageSend(channelID, "Webhook triggered!")
-        c.JSON(200, gin.H{"status": "success"})
-    }
-}
-``` 
+- Use HTTPS in production environments 

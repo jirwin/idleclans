@@ -10,16 +10,14 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/gin-gonic/gin"
-	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
-	"go.uber.org/zap"
 )
 
 type Bot struct {
-	session         *discordgo.Session
-	plugins         []Plugin
-	webhookHandlers map[string]WebhookHandler
-	webhookServer   *http.Server
-	mu              sync.RWMutex
+	session       *discordgo.Session
+	plugins       []Plugin
+	webhookSetups map[string]WebhookRouterSetup
+	webhookServer *http.Server
+	mu            sync.RWMutex
 }
 
 func (b *Bot) Start() error {
@@ -56,14 +54,14 @@ func (b *Bot) Close(ctx context.Context) error {
 	return finalErr
 }
 
-func (b *Bot) RegisterWebhookHandler(pathPrefix string, handler WebhookHandler) {
+func (b *Bot) RegisterWebhookRouter(pathPrefix string, setup WebhookRouterSetup) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if b.webhookHandlers == nil {
-		b.webhookHandlers = make(map[string]WebhookHandler)
+	if b.webhookSetups == nil {
+		b.webhookSetups = make(map[string]WebhookRouterSetup)
 	}
-	b.webhookHandlers[pathPrefix] = handler
+	b.webhookSetups[pathPrefix] = setup
 }
 
 func (b *Bot) startWebhookServer(port string) {
@@ -71,16 +69,14 @@ func (b *Bot) startWebhookServer(port string) {
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
 
-	// Add webhook routes
+	// Add webhook routes from plugins
 	b.mu.RLock()
-	for pathPrefix, handler := range b.webhookHandlers {
-		// Register both with and without trailing slash to avoid 301 redirects
-		router.Any(pathPrefix+"/*path", func(c *gin.Context) {
-			b.handleWebhook(c, handler)
-		})
-		router.Any(pathPrefix, func(c *gin.Context) {
-			b.handleWebhook(c, handler)
-		})
+	for pathPrefix, setup := range b.webhookSetups {
+		// Create a router group for this plugin
+		group := router.Group(pathPrefix)
+
+		// Let the plugin set up its routes
+		setup(group, b.session)
 	}
 	b.mu.RUnlock()
 
@@ -100,32 +96,6 @@ func (b *Bot) startWebhookServer(port string) {
 	}
 }
 
-func (b *Bot) handleWebhook(c *gin.Context, handler WebhookHandler) {
-	ctx := c.Request.Context()
-	l := ctxzap.Extract(ctx)
-
-	l.Info(
-		"Processing webhook request",
-		zap.String("method", c.Request.Method),
-		zap.String("path", c.Request.URL.Path),
-		zap.String("remote_addr", c.ClientIP()),
-	)
-
-	// Run handler in a goroutine to handle concurrently
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				l.Error("Webhook handler panicked", zap.Any("panic", r))
-			}
-		}()
-
-		handler(b.session, c)
-	}()
-
-	// Return immediately to avoid blocking
-	c.JSON(http.StatusOK, gin.H{"status": "processing"})
-}
-
 func New(token string, opts ...Option) (*Bot, error) {
 	if token == "" {
 		return nil, errors.New("token is required")
@@ -136,8 +106,8 @@ func New(token string, opts ...Option) (*Bot, error) {
 	}
 
 	b := &Bot{
-		session:         dg,
-		webhookHandlers: make(map[string]WebhookHandler),
+		session:       dg,
+		webhookSetups: make(map[string]WebhookRouterSetup),
 	}
 
 	for _, opt := range opts {
