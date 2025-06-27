@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/gin-gonic/gin"
 )
 
 type Plugin interface {
@@ -31,5 +32,13 @@ type MessageHandler func(*discordgo.Session, *discordgo.MessageCreate)
 func WithMessageHandler(handler func(*discordgo.Session, *discordgo.MessageCreate)) Option {
 	return func(b *Bot) {
 		b.session.AddHandler(handler)
+	}
+}
+
+type WebhookHandler func(*discordgo.Session, *gin.Context)
+
+func WithWebhookHandler(pathPrefix string, handler WebhookHandler) Option {
+	return func(b *Bot) {
+		b.RegisterWebhookHandler(pathPrefix, handler)
 	}
 }
