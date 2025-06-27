@@ -53,6 +53,8 @@ func (p *plugin) priceCmd(ctx context.Context) bot.MessageHandler {
 
 func (p *plugin) webhookHandler(ctx context.Context) bot.WebhookHandler {
 	return func(s *discordgo.Session, c *gin.Context) {
+		l := ctxzap.Extract(ctx)
+		l.Info("Processing webhook", zap.String("path", c.Request.URL.Path))
 		// Extract channel ID from query parameter or header
 		channelID := c.Query("channel_id")
 		if channelID == "" {
