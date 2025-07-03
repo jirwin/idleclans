@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/gin-gonic/gin"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"github.com/jirwin/idleclans/pkg/bot"
 	"go.uber.org/zap"
@@ -49,62 +48,4 @@ func (p *plugin) priceCmd(ctx context.Context) bot.MessageHandler {
 			)
 		}
 	}
-}
-
-func (p *plugin) setupWebhookRoutes(ctx context.Context, channelID string) bot.WebhookRouterSetup {
-	return func(router *gin.RouterGroup, s *discordgo.Session) {
-		// Base route - show available actions
-		router.GET("", func(c *gin.Context) {
-			c.JSON(200, gin.H{
-				"available_actions": []string{"price", "pvm"},
-				"usage":             "Use POST /webhook/idleclans/price or POST /webhook/idleclans/pvm",
-			})
-		})
-
-		// Price webhook route
-		router.POST("/clan", func(c *gin.Context) {
-			p.handleClanActionWebhook(ctx, s, c, channelID)
-		})
-	}
-}
-
-type webhookMetadata struct {
-	PlayerName    string `json:"playerName"`
-	GameMode      string `json:"gameMode"`
-	ClanName      string `json:"clanName"`
-	Timestamp     string `json:"timestamp"`
-	ClientVersion string `json:"clientVersion"`
-}
-
-type clanActionRequest struct {
-	Metadata webhookMetadata   `json:"metadata"`
-	Params   map[string]string `json:"params"`
-}
-
-func (p *plugin) handleClanActionWebhook(ctx context.Context, s *discordgo.Session, c *gin.Context, channelID string) {
-	l := ctxzap.Extract(ctx)
-
-	if channelID == "" {
-		c.JSON(400, gin.H{"error": "channel_id is required"})
-		return
-	}
-
-	req := &clanActionRequest{}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": fmt.Sprintf("invalid request: %s", err.Error())})
-		return
-	}
-
-	l.Info(
-		"Processing clan action webhook",
-		zap.String("player_name", req.Metadata.PlayerName),
-		zap.String("clan_name", req.Metadata.ClanName),
-		zap.String("game_mode", req.Metadata.GameMode),
-		zap.String("client_version", req.Metadata.ClientVersion),
-		zap.String("timestamp", req.Metadata.Timestamp),
-		zap.String("channel_id", channelID),
-	)
-
-	s.ChannelMessageSend(channelID, "Clan action received")
-	c.JSON(200, gin.H{"status": "success"})
 }
