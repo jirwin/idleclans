@@ -51,7 +51,7 @@ func (p *plugin) priceCmd(ctx context.Context) bot.MessageHandler {
 	}
 }
 
-func (p *plugin) setupWebhookRoutes(ctx context.Context) bot.WebhookRouterSetup {
+func (p *plugin) setupWebhookRoutes(ctx context.Context, channelID string) bot.WebhookRouterSetup {
 	return func(router *gin.RouterGroup, s *discordgo.Session) {
 		// Base route - show available actions
 		router.GET("", func(c *gin.Context) {
@@ -62,100 +62,49 @@ func (p *plugin) setupWebhookRoutes(ctx context.Context) bot.WebhookRouterSetup 
 		})
 
 		// Price webhook route
-		router.POST("/price", func(c *gin.Context) {
-			p.handlePriceWebhook(ctx, s, c)
-		})
-
-		// PVM webhook route
-		router.POST("/pvm", func(c *gin.Context) {
-			p.handlePvmWebhook(ctx, s, c)
+		router.POST("/clan", func(c *gin.Context) {
+			p.handleClanActionWebhook(ctx, s, c, channelID)
 		})
 	}
 }
 
-func (p *plugin) handlePriceWebhook(ctx context.Context, s *discordgo.Session, c *gin.Context) {
-	l := ctxzap.Extract(ctx)
+type webhookMetadata struct {
+	PlayerName    string `json:"playerName"`
+	GameMode      string `json:"gameMode"`
+	ClanName      string `json:"clanName"`
+	Timestamp     string `json:"timestamp"`
+	ClientVersion string `json:"clientVersion"`
+}
 
-	// Extract channel ID from query parameter or header
-	channelID := c.Query("channel_id")
-	if channelID == "" {
-		channelID = c.GetHeader("X-Discord-Channel-ID")
-	}
+type clanActionRequest struct {
+	Metadata webhookMetadata   `json:"metadata"`
+	Params   map[string]string `json:"params"`
+}
+
+func (p *plugin) handleClanActionWebhook(ctx context.Context, s *discordgo.Session, c *gin.Context, channelID string) {
+	l := ctxzap.Extract(ctx)
 
 	if channelID == "" {
 		c.JSON(400, gin.H{"error": "channel_id is required"})
 		return
 	}
 
-	var req struct {
-		ItemID string `json:"item_id" binding:"required"`
-	}
-
+	req := &clanActionRequest{}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": fmt.Sprintf("invalid request: %s", err.Error())})
 		return
 	}
 
 	l.Info(
-		"Processing price webhook",
-		zap.String("item_id", req.ItemID),
+		"Processing clan action webhook",
+		zap.String("player_name", req.Metadata.PlayerName),
+		zap.String("clan_name", req.Metadata.ClanName),
+		zap.String("game_mode", req.Metadata.GameMode),
+		zap.String("client_version", req.Metadata.ClientVersion),
+		zap.String("timestamp", req.Metadata.Timestamp),
 		zap.String("channel_id", channelID),
 	)
 
-	price, err := p.client.GetLatestPrice(ctx, req.ItemID)
-	if err != nil {
-		msg := fmt.Sprintf("Error getting price for %s: %s", req.ItemID, err.Error())
-		s.ChannelMessageSend(channelID, msg)
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-
-	printer := message.NewPrinter(language.English)
-	msg := printer.Sprintf(
-		"**Price Update for %s**\nLowest Sell: %dg (%d)\nHighest Buy: %dg (%d)",
-		req.ItemID,
-		price.LowestSellPrice,
-		price.LowestPriceVolume,
-		price.HighestBuyPrice,
-		price.HighestPriceVolume,
-	)
-
-	s.ChannelMessageSend(channelID, msg)
-	c.JSON(200, gin.H{"status": "message sent", "price": price})
-}
-
-func (p *plugin) handlePvmWebhook(ctx context.Context, s *discordgo.Session, c *gin.Context) {
-	l := ctxzap.Extract(ctx)
-
-	// Extract channel ID from query parameter or header
-	channelID := c.Query("channel_id")
-	if channelID == "" {
-		channelID = c.GetHeader("X-Discord-Channel-ID")
-	}
-
-	if channelID == "" {
-		c.JSON(400, gin.H{"error": "channel_id is required"})
-		return
-	}
-
-	var req struct {
-		PlayerName string `json:"player_name" binding:"required"`
-	}
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": fmt.Sprintf("invalid request: %s", err.Error())})
-		return
-	}
-
-	l.Info(
-		"Processing PVM webhook",
-		zap.String("player_name", req.PlayerName),
-		zap.String("channel_id", channelID),
-	)
-
-	// This is a placeholder - you would implement the actual PVM logic here
-	msg := fmt.Sprintf("**PVM Update for %s**\nThis is a webhook-triggered PVM update!", req.PlayerName)
-
-	s.ChannelMessageSend(channelID, msg)
-	c.JSON(200, gin.H{"status": "message sent", "player": req.PlayerName})
+	s.ChannelMessageSend(channelID, "Clan action received")
+	c.JSON(200, gin.H{"status": "success"})
 }

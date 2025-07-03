@@ -22,7 +22,7 @@ func (p *plugin) Load(ctx context.Context) []bot.Option {
 		bot.WithMessageHandler(p.priceCmd(ctx)),
 		bot.WithMessageHandler(p.pvmCmd(ctx)),
 		bot.WithMessageHandler(p.playerCmd(ctx)),
-		bot.WithWebhookRouter("/webhook/idleclans", p.setupWebhookRoutes(ctx)),
+		bot.WithWebhookRouter("/webhook/idleclans", p.setupWebhookRoutes(ctx, "1294739845645598772")),
 	}
 
 	return opts
