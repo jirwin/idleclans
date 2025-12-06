@@ -12,6 +12,8 @@ import (
 	"github.com/jirwin/idleclans/pkg/bot"
 	"github.com/jirwin/idleclans/pkg/idleclans"
 	"go.uber.org/zap"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 func generateSkillGrid(playerName string, skills map[string]float64, maxWidth int) string {
@@ -85,10 +87,163 @@ func (p *plugin) playerCmd(ctx context.Context) bot.MessageHandler {
 				return
 			}
 
-			s.ChannelMessageSend(
-				m.ChannelID,
-				generateSkillGrid(playerName, player.Skills, 65),
-			)
+			// Define valid skill names based on actual API response
+			// Skills come from API with capitalized names, but we'll normalize to lowercase for comparison
+			validSkills := map[string]bool{
+				"rigour":        true,
+				"strength":      true,
+				"defence":       true,
+				"archery":       true,
+				"magic":         true,
+				"health":        true,
+				"crafting":      true,
+				"woodcutting":   true,
+				"carpentry":     true,
+				"fishing":       true,
+				"cooking":       true,
+				"mining":        true,
+				"smithing":      true,
+				"foraging":      true,
+				"farming":       true,
+				"agility":       true,
+				"plundering":    true,
+				"enchanting":    true,
+				"brewing":       true,
+				"exterminating": true,
+			}
+
+			// Organize skills into groups for better display
+			combatSkills := []string{"rigour", "strength", "defence", "archery", "magic", "health"}
+			gatheringSkills := []string{"woodcutting", "mining", "fishing", "foraging", "farming"}
+			craftingSkills := []string{"crafting", "carpentry", "cooking", "smithing", "brewing", "enchanting"}
+			otherSkills := []string{"agility", "plundering", "exterminating"}
+
+			// Build fields for each skill category
+			fields := make([]*discordgo.MessageEmbedField, 0)
+			titleCaser := cases.Title(language.English)
+
+			// Helper function to get skill experience, handling case variations
+			getSkillExp := func(skillName string) (float64, bool) {
+				// Try lowercase first
+				if exp, ok := player.Skills[skillName]; ok {
+					return exp, true
+				}
+				// Try capitalized version
+				if exp, ok := player.Skills[titleCaser.String(skillName)]; ok {
+					return exp, true
+				}
+				// Try as-is (in case it's already in the map with different casing)
+				for k, v := range player.Skills {
+					if strings.EqualFold(k, skillName) {
+						return v, true
+					}
+				}
+				return 0, false
+			}
+
+			// Combat skills
+			var combatValue strings.Builder
+			for _, skillName := range combatSkills {
+				if exp, ok := getSkillExp(skillName); ok {
+					level, _ := idleclans.GetSkillLevel(int(exp))
+					combatValue.WriteString(fmt.Sprintf("**%s**: %d\n", titleCaser.String(skillName), level))
+				}
+			}
+			if combatValue.Len() > 0 {
+				fields = append(fields, &discordgo.MessageEmbedField{
+					Name:   "Combat",
+					Value:  combatValue.String(),
+					Inline: true,
+				})
+			}
+
+			// Gathering skills
+			var gatheringValue strings.Builder
+			for _, skillName := range gatheringSkills {
+				if exp, ok := getSkillExp(skillName); ok {
+					level, _ := idleclans.GetSkillLevel(int(exp))
+					gatheringValue.WriteString(fmt.Sprintf("**%s**: %d\n", titleCaser.String(skillName), level))
+				}
+			}
+			if gatheringValue.Len() > 0 {
+				fields = append(fields, &discordgo.MessageEmbedField{
+					Name:   "Gathering",
+					Value:  gatheringValue.String(),
+					Inline: true,
+				})
+			}
+
+			// Crafting skills
+			var craftingValue strings.Builder
+			for _, skillName := range craftingSkills {
+				if exp, ok := getSkillExp(skillName); ok {
+					level, _ := idleclans.GetSkillLevel(int(exp))
+					craftingValue.WriteString(fmt.Sprintf("**%s**: %d\n", titleCaser.String(skillName), level))
+				}
+			}
+			if craftingValue.Len() > 0 {
+				fields = append(fields, &discordgo.MessageEmbedField{
+					Name:   "Crafting",
+					Value:  craftingValue.String(),
+					Inline: true,
+				})
+			}
+
+			// Other skills
+			var otherValue strings.Builder
+			for _, skillName := range otherSkills {
+				if exp, ok := getSkillExp(skillName); ok {
+					level, _ := idleclans.GetSkillLevel(int(exp))
+					otherValue.WriteString(fmt.Sprintf("**%s**: %d\n", titleCaser.String(skillName), level))
+				}
+			}
+
+			// Also include any skills not in the predefined lists
+			// Only include skills that are valid according to the API structure
+			for skillName, exp := range player.Skills {
+				// Normalize skill name to lowercase for validation
+				normalizedSkill := strings.ToLower(skillName)
+
+				// Skip invalid skill names
+				if !validSkills[normalizedSkill] {
+					l.Warn("Unknown skill name from API", zap.String("skill", skillName))
+					continue
+				}
+
+				// Check if already in a category
+				found := false
+				for _, list := range [][]string{combatSkills, gatheringSkills, craftingSkills, otherSkills} {
+					for _, s := range list {
+						if normalizedSkill == s {
+							found = true
+							break
+						}
+					}
+					if found {
+						break
+					}
+				}
+				if !found {
+					level, _ := idleclans.GetSkillLevel(int(exp))
+					otherValue.WriteString(fmt.Sprintf("**%s**: %d\n", titleCaser.String(normalizedSkill), level))
+				}
+			}
+			if otherValue.Len() > 0 {
+				fields = append(fields, &discordgo.MessageEmbedField{
+					Name:   "Other",
+					Value:  otherValue.String(),
+					Inline: true,
+				})
+			}
+
+			embed := &discordgo.MessageEmbed{
+				Title:       fmt.Sprintf("Player: %s", playerName),
+				Description: "Skill Levels",
+				Color:       0x3498db, // Blue color
+				Fields:      fields,
+			}
+
+			s.ChannelMessageSendEmbeds(m.ChannelID, []*discordgo.MessageEmbed{embed})
 		}
 	}
 }
