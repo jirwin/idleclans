@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"github.com/jmoiron/sqlx"
@@ -71,11 +72,11 @@ func (d *DB) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_quest_kills_quest_id ON quest_kills(quest_id);
 	
 	CREATE TABLE IF NOT EXISTS player_keys (
-		discord_user_id TEXT NOT NULL,
+		player_name TEXT NOT NULL,
 		key_type TEXT NOT NULL,
 		count INTEGER NOT NULL DEFAULT 0,
 		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		PRIMARY KEY (discord_user_id, key_type)
+		PRIMARY KEY (player_name, key_type)
 	);
 
 	CREATE TABLE IF NOT EXISTS player_alts (
@@ -86,6 +87,18 @@ func (d *DB) initSchema() error {
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_player_alts_user ON player_alts(discord_user_id);
+
+	CREATE TABLE IF NOT EXISTS web_sessions (
+		session_id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		username TEXT NOT NULL,
+		avatar TEXT,
+		expires_at TIMESTAMP NOT NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_web_sessions_user ON web_sessions(user_id);
+	CREATE INDEX IF NOT EXISTS idx_web_sessions_expires ON web_sessions(expires_at);
 	`
 
 	_, err := d.db.Exec(schema)
@@ -101,6 +114,38 @@ func (d *DB) initSchema() error {
 	// Update existing rows to set max_required_kills = required_kills if it's NULL
 	// This handles both new columns (which will be NULL) and ensures consistency
 	_, _ = d.db.Exec(`UPDATE weekly_quests SET max_required_kills = required_kills WHERE max_required_kills IS NULL`)
+
+	// Migration: Convert player_keys from discord_user_id to player_name
+	// Check if old schema exists (has discord_user_id column)
+	var hasOldSchema bool
+	row := d.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('player_keys') WHERE name='discord_user_id'`)
+	var count int
+	if err := row.Scan(&count); err == nil && count > 0 {
+		hasOldSchema = true
+	}
+
+	if hasOldSchema {
+		// Migrate old data: copy keys from discord_user_id to player_name
+		_, _ = d.db.Exec(`
+			CREATE TABLE IF NOT EXISTS player_keys_new (
+				player_name TEXT NOT NULL,
+				key_type TEXT NOT NULL,
+				count INTEGER NOT NULL DEFAULT 0,
+				updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+				PRIMARY KEY (player_name, key_type)
+			)
+		`)
+		// Copy data from old table, joining with players to get player_name
+		_, _ = d.db.Exec(`
+			INSERT OR IGNORE INTO player_keys_new (player_name, key_type, count, updated_at)
+			SELECT p.player_name, pk.key_type, pk.count, pk.updated_at
+			FROM player_keys pk
+			JOIN players p ON pk.discord_user_id = p.discord_user_id
+		`)
+		// Drop old table and rename new one
+		_, _ = d.db.Exec(`DROP TABLE player_keys`)
+		_, _ = d.db.Exec(`ALTER TABLE player_keys_new RENAME TO player_keys`)
+	}
 
 	return nil
 }
@@ -487,30 +532,30 @@ func (d *DB) GetPlayersWithBossQuest(ctx context.Context, bossName string, weekN
 	return results, nil
 }
 
-// UpsertPlayerKeys updates the key count for a specific key type for a player
-func (d *DB) UpsertPlayerKeys(ctx context.Context, discordUserID string, keyType string, count int) error {
+// UpsertPlayerKeys updates the key count for a specific key type for a player (by player name)
+func (d *DB) UpsertPlayerKeys(ctx context.Context, playerName string, keyType string, count int) error {
 	l := ctxzap.Extract(ctx)
 	
 	query := `
-		INSERT INTO player_keys (discord_user_id, key_type, count, updated_at)
+		INSERT INTO player_keys (player_name, key_type, count, updated_at)
 		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-		ON CONFLICT(discord_user_id, key_type) DO UPDATE SET
+		ON CONFLICT(player_name, key_type) DO UPDATE SET
 			count = excluded.count,
 			updated_at = CURRENT_TIMESTAMP
 	`
 	
-	_, err := d.db.ExecContext(ctx, query, discordUserID, keyType, count)
+	_, err := d.db.ExecContext(ctx, query, playerName, keyType, count)
 	if err != nil {
-		l.Error("Failed to upsert player keys", zap.Error(err), zap.String("user_id", discordUserID), zap.String("key", keyType), zap.Int("count", count))
+		l.Error("Failed to upsert player keys", zap.Error(err), zap.String("player_name", playerName), zap.String("key", keyType), zap.Int("count", count))
 		return err
 	}
 	
 	return nil
 }
 
-// GetPlayerKeys returns all key counts for a player
-func (d *DB) GetPlayerKeys(ctx context.Context, discordUserID string) (map[string]int, error) {
-	query := `SELECT key_type, count FROM player_keys WHERE discord_user_id = ?`
+// GetPlayerKeys returns all key counts for a player (by player name)
+func (d *DB) GetPlayerKeys(ctx context.Context, playerName string) (map[string]int, error) {
+	query := `SELECT key_type, count FROM player_keys WHERE player_name = ?`
 	
 	type keyRow struct {
 		KeyType string `db:"key_type"`
@@ -518,7 +563,7 @@ func (d *DB) GetPlayerKeys(ctx context.Context, discordUserID string) (map[strin
 	}
 	
 	var rows []keyRow
-	err := d.db.SelectContext(ctx, &rows, query, discordUserID)
+	err := d.db.SelectContext(ctx, &rows, query, playerName)
 	if err != nil {
 		return nil, err
 	}
@@ -531,12 +576,12 @@ func (d *DB) GetPlayerKeys(ctx context.Context, discordUserID string) (map[strin
 	return result, nil
 }
 
-// GetPlayerKeyCount returns the count for a specific key type
-func (d *DB) GetPlayerKeyCount(ctx context.Context, discordUserID string, keyType string) (int, error) {
+// GetPlayerKeyCount returns the count for a specific key type (by player name)
+func (d *DB) GetPlayerKeyCount(ctx context.Context, playerName string, keyType string) (int, error) {
 	var count int
-	query := `SELECT count FROM player_keys WHERE discord_user_id = ? AND key_type = ?`
+	query := `SELECT count FROM player_keys WHERE player_name = ? AND key_type = ?`
 	
-	err := d.db.GetContext(ctx, &count, query, discordUserID, keyType)
+	err := d.db.GetContext(ctx, &count, query, playerName, keyType)
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
@@ -557,43 +602,14 @@ type PlayerKeyEntry struct {
 // GetAllPlayerKeys returns all keys for all players
 func (d *DB) GetAllPlayerKeys(ctx context.Context) ([]PlayerKeyEntry, error) {
 	query := `
-		SELECT p.player_name, pk.key_type, pk.count
-		FROM player_keys pk
-		JOIN players p ON pk.discord_user_id = p.discord_user_id
-		WHERE pk.count > 0
-		ORDER BY pk.key_type, p.player_name
+		SELECT player_name, key_type, count
+		FROM player_keys
+		WHERE count > 0
+		ORDER BY key_type, player_name
 	`
 	var results []PlayerKeyEntry
 	err := d.db.SelectContext(ctx, &results, query)
 	return results, err
-}
-
-// GetPlayerKeysByName returns all key counts for a player by name
-func (d *DB) GetPlayerKeysByName(ctx context.Context, playerName string) (map[string]int, error) {
-	query := `
-		SELECT pk.key_type, pk.count 
-		FROM player_keys pk
-		JOIN players p ON pk.discord_user_id = p.discord_user_id
-		WHERE p.player_name = ?
-	`
-	
-	type keyRow struct {
-		KeyType string `db:"key_type"`
-		Count   int    `db:"count"`
-	}
-	
-	var rows []keyRow
-	err := d.db.SelectContext(ctx, &rows, query, playerName)
-	if err != nil {
-		return nil, err
-	}
-	
-	result := make(map[string]int)
-	for _, row := range rows {
-		result[row.KeyType] = row.Count
-	}
-	
-	return result, nil
 }
 
 // RegisterAlt adds an alternate player name for a Discord user
@@ -653,6 +669,23 @@ func (d *DB) GetAllPlayerNames(ctx context.Context, discordUserID string) ([]str
 	return names, nil
 }
 
+// PlayerRow represents a row in the players table
+type PlayerRow struct {
+	DiscordUserID string `db:"discord_user_id"`
+	PlayerName    string `db:"player_name"`
+}
+
+// GetAllPlayers returns all registered players
+func (d *DB) GetAllPlayers(ctx context.Context) ([]PlayerRow, error) {
+	query := `SELECT discord_user_id, player_name FROM players ORDER BY player_name`
+	var players []PlayerRow
+	err := d.db.SelectContext(ctx, &players, query)
+	if err != nil {
+		return nil, err
+	}
+	return players, nil
+}
+
 // GetDiscordUserIDForPlayer returns the Discord user ID for a player name (checking both main and alts)
 func (d *DB) GetDiscordUserIDForPlayer(ctx context.Context, playerName string) (string, error) {
 	// Check main players table first
@@ -677,4 +710,56 @@ func (d *DB) GetDiscordUserIDForPlayer(ctx context.Context, playerName string) (
 	}
 	
 	return discordUserID, nil
+}
+
+// WebSession represents a web session stored in the database
+type WebSession struct {
+	SessionID string    `db:"session_id"`
+	UserID    string    `db:"user_id"`
+	Username  string    `db:"username"`
+	Avatar    string    `db:"avatar"`
+	ExpiresAt time.Time `db:"expires_at"`
+}
+
+// CreateSession creates a new web session
+func (d *DB) CreateSession(ctx context.Context, sessionID, userID, username, avatar string, expiresAt time.Time) error {
+	query := `
+		INSERT INTO web_sessions (session_id, user_id, username, avatar, expires_at, created_at)
+		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(session_id) DO UPDATE SET
+			user_id = excluded.user_id,
+			username = excluded.username,
+			avatar = excluded.avatar,
+			expires_at = excluded.expires_at
+	`
+	_, err := d.db.ExecContext(ctx, query, sessionID, userID, username, avatar, expiresAt)
+	return err
+}
+
+// GetSession retrieves a web session by ID
+func (d *DB) GetSession(ctx context.Context, sessionID string) (*WebSession, error) {
+	var session WebSession
+	query := `SELECT session_id, user_id, username, avatar, expires_at FROM web_sessions WHERE session_id = ?`
+	err := d.db.GetContext(ctx, &session, query, sessionID)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &session, nil
+}
+
+// DeleteSession deletes a web session
+func (d *DB) DeleteSession(ctx context.Context, sessionID string) error {
+	query := `DELETE FROM web_sessions WHERE session_id = ?`
+	_, err := d.db.ExecContext(ctx, query, sessionID)
+	return err
+}
+
+// CleanupExpiredSessions removes expired sessions
+func (d *DB) CleanupExpiredSessions(ctx context.Context) error {
+	query := `DELETE FROM web_sessions WHERE expires_at < CURRENT_TIMESTAMP`
+	_, err := d.db.ExecContext(ctx, query)
+	return err
 }

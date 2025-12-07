@@ -1,2 +1,30 @@
-
+# Build output
 dist/
+
+# Web frontend dependencies
+web/node_modules/
+
+# Generated web assets (keep placeholder)
+pkg/web/static/assets/
+pkg/web/static/index.html
+!pkg/web/static/.gitkeep
+
+# Database files
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local

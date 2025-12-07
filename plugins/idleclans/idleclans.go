@@ -10,9 +10,13 @@ import (
 	"go.uber.org/zap"
 )
 
+// DataChangeNotifier is a function that notifies about data changes
+type DataChangeNotifier func(changeType string)
+
 type plugin struct {
 	client       *idleclans.Client
 	questsHandler *questsHandler
+	notifyFunc   DataChangeNotifier
 }
 
 func (p *plugin) Name() string {
@@ -28,6 +32,11 @@ func (p *plugin) Load(ctx context.Context) []bot.Option {
 	if err != nil {
 		// Log error but continue - quests will be unavailable
 		ctxzap.Extract(ctx).Error("Failed to initialize quests handler", zap.Error(err))
+	}
+	
+	// Pass notify function to handler if set
+	if p.questsHandler != nil && p.notifyFunc != nil {
+		p.questsHandler.notifyFunc = p.notifyFunc
 	}
 
 	opts := []bot.Option{
@@ -61,5 +70,20 @@ func (p *plugin) Close(ctx context.Context) error {
 func New() bot.Plugin {
 	return &plugin{
 		client: idleclans.New(),
+	}
+}
+
+// SetNotifyFunc sets the function to call when data changes
+func (p *plugin) SetNotifyFunc(fn DataChangeNotifier) {
+	p.notifyFunc = fn
+	if p.questsHandler != nil {
+		p.questsHandler.notifyFunc = fn
+	}
+}
+
+// notifyDataChange notifies connected clients of data changes
+func (p *plugin) notifyDataChange(changeType string) {
+	if p.notifyFunc != nil {
+		p.notifyFunc(changeType)
 	}
 }

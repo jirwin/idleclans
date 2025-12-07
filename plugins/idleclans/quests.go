@@ -19,7 +19,16 @@ import (
 )
 
 type questsHandler struct {
-	db *quests.DB
+	db         *quests.DB
+	notifyFunc DataChangeNotifier
+}
+
+// notifyDataChange notifies connected clients of data changes
+func (h *questsHandler) notifyDataChange(changeType string) {
+	if h.notifyFunc != nil {
+		h.notifyFunc(changeType)
+	}
+	// Note: if notifyFunc is nil, notifications won't be sent (web server not configured)
 }
 
 func newQuestsHandler() (*questsHandler, error) {
@@ -427,6 +436,7 @@ func (h *questsHandler) handleUpdate(ctx context.Context, s *discordgo.Session, 
 
 	if updates > 0 {
 		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Updated %d quest(s) for **%s**", updates, playerName))
+		h.notifyDataChange("quest")
 	}
 }
 
@@ -510,9 +520,9 @@ func (h *questsHandler) handleKeys(ctx context.Context, s *discordgo.Session, m 
 
 	// 3. Player View (Single player name)
 	targetPlayer := strings.Join(args, " ")
-	keysMap, err := h.db.GetPlayerKeysByName(ctx, targetPlayer)
+	keysMap, err := h.db.GetPlayerKeys(ctx, targetPlayer)
 	if err != nil {
-		l.Error("Failed to get player keys by name", zap.Error(err))
+		l.Error("Failed to get player keys", zap.Error(err))
 		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Error getting keys for %s: %s", targetPlayer, err.Error()))
 		return
 	}
@@ -568,7 +578,7 @@ func (h *questsHandler) updatePlayerKeys(ctx context.Context, s *discordgo.Sessi
 			continue
 		}
 
-		err = h.db.UpsertPlayerKeys(ctx, m.Author.ID, keyType, count)
+		err = h.db.UpsertPlayerKeys(ctx, playerName, keyType, count)
 		if err != nil {
 			l.Error("Failed to update player keys", zap.Error(err))
 			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Error updating %s: %s", keyType, err.Error()))
@@ -579,6 +589,7 @@ func (h *questsHandler) updatePlayerKeys(ctx context.Context, s *discordgo.Sessi
 
 	if updates > 0 {
 		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Updated %d key count(s) for **%s**", updates, playerName))
+		h.notifyDataChange("keys")
 	}
 }
 
@@ -694,12 +705,13 @@ func (h *questsHandler) handleComplete(ctx context.Context, s *discordgo.Session
 	if keysRemaining != nil {
 		keyType, ok := quests.GetKeyForBoss(bossName)
 		if ok {
-			err = h.db.UpsertPlayerKeys(ctx, m.Author.ID, keyType, *keysRemaining)
+			err = h.db.UpsertPlayerKeys(ctx, playerName, keyType, *keysRemaining)
 			if err != nil {
 				l.Error("Failed to update player keys", zap.Error(err))
 				msg += fmt.Sprintf("\n(Warning: Failed to update keys: %s)", err.Error())
 			} else {
 				msg += fmt.Sprintf("\nUpdated **%s** keys to %d", cases.Title(language.English).String(keyType), *keysRemaining)
+				h.notifyDataChange("keys")
 			}
 		} else {
 			msg += "\n(Warning: Could not determine key type for this boss)"
@@ -707,6 +719,7 @@ func (h *questsHandler) handleComplete(ctx context.Context, s *discordgo.Session
 	}
 
 	s.ChannelMessageSend(m.ChannelID, msg)
+	h.notifyDataChange("quest")
 }
 
 func (h *questsHandler) handleBosses(ctx context.Context, s *discordgo.Session, m *discordgo.MessageCreate, args []string) {
@@ -938,6 +951,7 @@ func (h *questsHandler) updatePlayerBosses(ctx context.Context, s *discordgo.Ses
 
 	if updates > 0 {
 		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Updated %d quest(s) for **%s**", updates, playerName))
+		h.notifyDataChange("quest")
 	}
 }
 

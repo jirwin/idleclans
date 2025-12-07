@@ -5,10 +5,13 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"strconv"
 	"syscall"
 
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"github.com/jirwin/idleclans/pkg/bot"
+	"github.com/jirwin/idleclans/pkg/quests"
+	"github.com/jirwin/idleclans/pkg/web"
 	icPlugin "github.com/jirwin/idleclans/plugins/idleclans"
 	"go.uber.org/zap"
 )
@@ -40,6 +43,33 @@ func getDiscordToken() string {
 	return os.Getenv("DISCORD_TOKEN")
 }
 
+// getCredential retrieves a credential from systemd credentials first,
+// then falls back to environment variable
+func getCredential(credName, envName string) string {
+	if credsDir := os.Getenv("CREDENTIALS_DIRECTORY"); credsDir != "" {
+		if data, err := os.ReadFile(path.Join(credsDir, credName)); err == nil {
+			value := string(data)
+			if len(value) > 0 && value[len(value)-1] == '\n' {
+				value = value[:len(value)-1]
+			}
+			return value
+		}
+	}
+	return os.Getenv(envName)
+}
+
+func getEnvInt(name string, defaultVal int) int {
+	val := os.Getenv(name)
+	if val == "" {
+		return defaultVal
+	}
+	i, err := strconv.Atoi(val)
+	if err != nil {
+		return defaultVal
+	}
+	return i
+}
+
 func main() {
 	ctx := context.Background()
 
@@ -52,14 +82,73 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Initialize web server if configured
+	var webServer *web.Server
+	discordClientID := getCredential("discord_client_id", "DISCORD_CLIENT_ID")
+	discordClientSecret := getCredential("discord_client_secret", "DISCORD_CLIENT_SECRET")
+
+	if discordClientID != "" && discordClientSecret != "" {
+		// Create database connection for web server
+		webDB, err := quests.NewDB("quests.db")
+		if err != nil {
+			l.Error("Failed to open database for web server", zap.Error(err))
+			os.Exit(1)
+		}
+		defer webDB.Close()
+
+		webConfig := &web.Config{
+			PublicPort:          getEnvInt("WEB_PUBLIC_PORT", 8080),
+			AdminPort:           getEnvInt("WEB_ADMIN_PORT", 8081),
+			BaseURL:             os.Getenv("WEB_BASE_URL"),
+			DiscordClientID:     discordClientID,
+			DiscordClientSecret: discordClientSecret,
+			SessionSecret:       getCredential("session_secret", "SESSION_SECRET"),
+		}
+
+		if webConfig.BaseURL == "" {
+			webConfig.BaseURL = "http://localhost:" + strconv.Itoa(webConfig.PublicPort)
+		}
+
+		webServer, err = web.NewServer(webConfig, webDB, l)
+		if err != nil {
+			l.Error("Failed to create web server", zap.Error(err))
+			os.Exit(1)
+		}
+
+		if err := webServer.Start(ctx); err != nil {
+			l.Error("Failed to start web server", zap.Error(err))
+			os.Exit(1)
+		}
+
+		l.Info("Web server started",
+			zap.Int("public_port", webConfig.PublicPort),
+			zap.Int("admin_port", webConfig.AdminPort),
+		)
+	} else {
+		l.Info("Web server disabled (DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET not set)")
+	}
+
 	b, err := bot.New(discordToken)
 	if err != nil {
 		l.Error("Error creating bot,", zap.Error(err))
 		os.Exit(1)
 	}
 
+	// Create the plugin
+	plugin := icPlugin.New()
+	
+	// If web server is running, connect notifications
+	if webServer != nil {
+		if p, ok := plugin.(interface{ SetNotifyFunc(icPlugin.DataChangeNotifier) }); ok {
+			p.SetNotifyFunc(webServer.NotifyDataChange)
+			l.Info("Connected web server notifications to bot plugin")
+		} else {
+			l.Warn("Failed to connect web server notifications - type assertion failed")
+		}
+	}
+
 	b.LoadPlugins(ctx, []bot.Plugin{
-		icPlugin.New(),
+		plugin,
 	})
 
 	err = b.Start()
@@ -73,6 +162,14 @@ func main() {
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt, os.Kill)
 	<-sc
+
+	l.Info("Shutting down...")
+
+	if webServer != nil {
+		if err := webServer.Stop(ctx); err != nil {
+			l.Error("Error stopping web server", zap.Error(err))
+		}
+	}
 
 	b.Close(ctx)
 }
