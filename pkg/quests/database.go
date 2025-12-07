@@ -125,28 +125,86 @@ func (d *DB) initSchema() error {
 	}
 
 	if hasOldSchema {
-		// Migrate old data: copy keys from discord_user_id to player_name
-		_, _ = d.db.Exec(`
-			CREATE TABLE IF NOT EXISTS player_keys_new (
-				player_name TEXT NOT NULL,
-				key_type TEXT NOT NULL,
-				count INTEGER NOT NULL DEFAULT 0,
-				updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-				PRIMARY KEY (player_name, key_type)
-			)
-		`)
-		// Copy data from old table, joining with players to get player_name
-		_, _ = d.db.Exec(`
-			INSERT OR IGNORE INTO player_keys_new (player_name, key_type, count, updated_at)
-			SELECT p.player_name, pk.key_type, pk.count, pk.updated_at
-			FROM player_keys pk
-			JOIN players p ON pk.discord_user_id = p.discord_user_id
-		`)
-		// Drop old table and rename new one
-		_, _ = d.db.Exec(`DROP TABLE player_keys`)
-		_, _ = d.db.Exec(`ALTER TABLE player_keys_new RENAME TO player_keys`)
+		if err := d.migratePlayerKeysToPlayerName(); err != nil {
+			return fmt.Errorf("failed to migrate player_keys: %w", err)
+		}
 	}
 
+	return nil
+}
+
+// migratePlayerKeysToPlayerName migrates the player_keys table from discord_user_id to player_name
+// It handles orphaned records by logging warnings and skipping them (they would be unresolvable anyway)
+func (d *DB) migratePlayerKeysToPlayerName() error {
+	// First, check for orphaned records that would be lost
+	orphanedQuery := `
+		SELECT pk.discord_user_id, pk.key_type, pk.count
+		FROM player_keys pk
+		LEFT JOIN players p ON pk.discord_user_id = p.discord_user_id
+		WHERE p.discord_user_id IS NULL
+	`
+	type orphanedRecord struct {
+		DiscordUserID string `db:"discord_user_id"`
+		KeyType       string `db:"key_type"`
+		Count         int    `db:"count"`
+	}
+	var orphaned []orphanedRecord
+	if err := d.db.Select(&orphaned, orphanedQuery); err != nil {
+		return fmt.Errorf("failed to check for orphaned records: %w", err)
+	}
+
+	if len(orphaned) > 0 {
+		// Log warning about orphaned records - these cannot be migrated
+		// because we don't know what player_name they belong to
+		fmt.Printf("WARNING: Found %d orphaned player_keys records that will be skipped during migration:\n", len(orphaned))
+		for _, rec := range orphaned {
+			fmt.Printf("  - discord_user_id=%s, key_type=%s, count=%d\n", rec.DiscordUserID, rec.KeyType, rec.Count)
+		}
+		fmt.Println("These records have discord_user_id values that don't exist in the players table.")
+		fmt.Println("They will NOT be migrated. If you need to preserve this data, restore from backup before continuing.")
+	}
+
+	// Create the new table
+	_, err := d.db.Exec(`
+		CREATE TABLE IF NOT EXISTS player_keys_new (
+			player_name TEXT NOT NULL,
+			key_type TEXT NOT NULL,
+			count INTEGER NOT NULL DEFAULT 0,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (player_name, key_type)
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create player_keys_new table: %w", err)
+	}
+
+	// Copy data from old table, joining with players to get player_name
+	// Using INNER JOIN intentionally - orphaned records are logged above and cannot be migrated
+	result, err := d.db.Exec(`
+		INSERT OR IGNORE INTO player_keys_new (player_name, key_type, count, updated_at)
+		SELECT p.player_name, pk.key_type, pk.count, pk.updated_at
+		FROM player_keys pk
+		JOIN players p ON pk.discord_user_id = p.discord_user_id
+	`)
+	if err != nil {
+		// Cleanup on failure
+		d.db.Exec(`DROP TABLE IF EXISTS player_keys_new`)
+		return fmt.Errorf("failed to copy data to player_keys_new: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	fmt.Printf("Migrated %d player_keys records to new schema\n", rowsAffected)
+
+	// Drop old table and rename new one
+	if _, err := d.db.Exec(`DROP TABLE player_keys`); err != nil {
+		return fmt.Errorf("failed to drop old player_keys table: %w", err)
+	}
+
+	if _, err := d.db.Exec(`ALTER TABLE player_keys_new RENAME TO player_keys`); err != nil {
+		return fmt.Errorf("failed to rename player_keys_new to player_keys: %w", err)
+	}
+
+	fmt.Println("Successfully migrated player_keys table from discord_user_id to player_name")
 	return nil
 }
 
@@ -555,7 +613,7 @@ func (d *DB) GetPlayersWithBossQuest(ctx context.Context, bossName string, weekN
 	// This ensures the owner gets pinged even if they didn't submit the quest
 	for i := range results {
 		playerName := results[i].PlayerName
-		
+
 		// Check if this player is someone's main
 		var ownerID string
 		mainQuery := `SELECT discord_user_id FROM players WHERE player_name = ?`
@@ -565,7 +623,7 @@ func (d *DB) GetPlayersWithBossQuest(ctx context.Context, bossName string, weekN
 			results[i].DiscordUserID = ownerID
 			continue
 		}
-		
+
 		// Check if this player is someone's alt
 		altQuery := `SELECT discord_user_id FROM player_alts WHERE player_name = ?`
 		err = d.db.GetContext(ctx, &ownerID, altQuery, playerName)
@@ -581,7 +639,7 @@ func (d *DB) GetPlayersWithBossQuest(ctx context.Context, bossName string, weekN
 // UpsertPlayerKeys updates the key count for a specific key type for a player (by player name)
 func (d *DB) UpsertPlayerKeys(ctx context.Context, playerName string, keyType string, count int) error {
 	l := ctxzap.Extract(ctx)
-	
+
 	query := `
 		INSERT INTO player_keys (player_name, key_type, count, updated_at)
 		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
@@ -589,36 +647,36 @@ func (d *DB) UpsertPlayerKeys(ctx context.Context, playerName string, keyType st
 			count = excluded.count,
 			updated_at = CURRENT_TIMESTAMP
 	`
-	
+
 	_, err := d.db.ExecContext(ctx, query, playerName, keyType, count)
 	if err != nil {
 		l.Error("Failed to upsert player keys", zap.Error(err), zap.String("player_name", playerName), zap.String("key", keyType), zap.Int("count", count))
 		return err
 	}
-	
+
 	return nil
 }
 
 // GetPlayerKeys returns all key counts for a player (by player name)
 func (d *DB) GetPlayerKeys(ctx context.Context, playerName string) (map[string]int, error) {
 	query := `SELECT key_type, count FROM player_keys WHERE player_name = ?`
-	
+
 	type keyRow struct {
 		KeyType string `db:"key_type"`
 		Count   int    `db:"count"`
 	}
-	
+
 	var rows []keyRow
 	err := d.db.SelectContext(ctx, &rows, query, playerName)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	result := make(map[string]int)
 	for _, row := range rows {
 		result[row.KeyType] = row.Count
 	}
-	
+
 	return result, nil
 }
 
@@ -626,7 +684,7 @@ func (d *DB) GetPlayerKeys(ctx context.Context, playerName string) (map[string]i
 func (d *DB) GetPlayerKeyCount(ctx context.Context, playerName string, keyType string) (int, error) {
 	var count int
 	query := `SELECT count FROM player_keys WHERE player_name = ? AND key_type = ?`
-	
+
 	err := d.db.GetContext(ctx, &count, query, playerName, keyType)
 	if err == sql.ErrNoRows {
 		return 0, nil
@@ -634,7 +692,7 @@ func (d *DB) GetPlayerKeyCount(ctx context.Context, playerName string, keyType s
 	if err != nil {
 		return 0, err
 	}
-	
+
 	return count, nil
 }
 
@@ -685,32 +743,32 @@ func (d *DB) RemoveAlt(ctx context.Context, discordUserID, playerName string) er
 // GetAlts returns all alternate player names for a Discord user
 func (d *DB) GetAlts(ctx context.Context, discordUserID string) ([]string, error) {
 	query := `SELECT player_name FROM player_alts WHERE discord_user_id = ? ORDER BY player_name`
-	
+
 	var alts []string
 	err := d.db.SelectContext(ctx, &alts, query, discordUserID)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return alts, nil
 }
 
 // GetAllPlayerNames returns all player names for a Discord user (main + alts)
 func (d *DB) GetAllPlayerNames(ctx context.Context, discordUserID string) ([]string, error) {
 	var names []string
-	
+
 	// Get main player name
 	mainName, err := d.GetPlayerName(ctx, discordUserID)
 	if err == nil && mainName != "" {
 		names = append(names, mainName)
 	}
-	
+
 	// Get alts
 	alts, err := d.GetAlts(ctx, discordUserID)
 	if err != nil {
 		return names, err
 	}
-	
+
 	names = append(names, alts...)
 	return names, nil
 }
@@ -781,7 +839,7 @@ func (d *DB) GetDiscordUserIDForPlayer(ctx context.Context, playerName string) (
 	if err != sql.ErrNoRows {
 		return "", err
 	}
-	
+
 	// Check alts table
 	query = `SELECT discord_user_id FROM player_alts WHERE player_name = ?`
 	err = d.db.GetContext(ctx, &discordUserID, query, playerName)
@@ -791,7 +849,7 @@ func (d *DB) GetDiscordUserIDForPlayer(ctx context.Context, playerName string) (
 	if err != nil {
 		return "", err
 	}
-	
+
 	return discordUserID, nil
 }
 
