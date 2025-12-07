@@ -33,7 +33,7 @@ func (a *botAdapter) SendMessageWithEmbed(channelID, content string, embed *web.
 		Description: embed.Description,
 		Color:       embed.Color,
 	}
-	
+
 	for _, field := range embed.Fields {
 		dgEmbed.Fields = append(dgEmbed.Fields, &discordgo.MessageEmbedField{
 			Name:   field.Name,
@@ -41,7 +41,7 @@ func (a *botAdapter) SendMessageWithEmbed(channelID, content string, embed *web.
 			Inline: field.Inline,
 		})
 	}
-	
+
 	return a.bot.SendMessageWithEmbed(channelID, content, dgEmbed)
 }
 
@@ -99,6 +99,14 @@ func getEnvInt(name string, defaultVal int) int {
 	return i
 }
 
+func getEnvString(name, defaultVal string) string {
+	val := os.Getenv(name)
+	if val == "" {
+		return defaultVal
+	}
+	return val
+}
+
 func main() {
 	ctx := context.Background()
 
@@ -134,6 +142,9 @@ func main() {
 			SessionSecret:       getCredential("session_secret", "SESSION_SECRET"),
 			RequiredGuild:       os.Getenv("REQUIRED_GUILD"),
 			DiscordChannelID:    os.Getenv("DISCORD_CHANNEL_ID"),
+			OllamaHost:          getEnvString("OLLAMA_HOST", "http://mother:11434"),
+			OllamaModel:         getEnvString("OLLAMA_MODEL", "qwen:110b"),
+			OllamaAPIKey:        getEnvString("OLLAMA_API_KEY", "ollama"),
 		}
 
 		if webConfig.BaseURL == "" {
@@ -168,10 +179,12 @@ func main() {
 
 	// Create the plugin
 	plugin := icPlugin.New()
-	
+
 	// If web server is running, connect notifications
 	if webServer != nil {
-		if p, ok := plugin.(interface{ SetNotifyFunc(icPlugin.DataChangeNotifier) }); ok {
+		if p, ok := plugin.(interface {
+			SetNotifyFunc(icPlugin.DataChangeNotifier)
+		}); ok {
 			p.SetNotifyFunc(webServer.NotifyDataChange)
 			l.Info("Connected web server notifications to bot plugin")
 		} else {

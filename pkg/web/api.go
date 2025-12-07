@@ -1,27 +1,36 @@
 package web
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/png"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	_ "image/gif"
+	_ "image/jpeg"
+
+	"github.com/jirwin/idleclans/pkg/ollama"
 	"github.com/jirwin/idleclans/pkg/quests"
 	"go.uber.org/zap"
 )
 
 // UserData represents the full data for a user
 type UserData struct {
-	DiscordID  string                       `json:"discord_id"`
-	Username   string                       `json:"username"`
-	Avatar     string                       `json:"avatar"`
-	PlayerName string                       `json:"player_name"`
-	Alts       []string                     `json:"alts"`
-	Quests     map[string][]Quest           `json:"quests"` // keyed by player name
-	Keys       map[string]map[string]int    `json:"keys"`   // keyed by player name, then key type
+	DiscordID  string                    `json:"discord_id"`
+	Username   string                    `json:"username"`
+	Avatar     string                    `json:"avatar"`
+	PlayerName string                    `json:"player_name"`
+	Alts       []string                  `json:"alts"`
+	Quests     map[string][]Quest        `json:"quests"` // keyed by player name
+	Keys       map[string]map[string]int `json:"keys"`   // keyed by player name, then key type
 }
 
 // Quest represents a quest for the API
@@ -353,7 +362,7 @@ func (s *Server) handleAddAlt(w http.ResponseWriter, r *http.Request) {
 	// Fetch player from IdleClans API to verify
 	s.logger.Info("Looking up alt in IdleClans API",
 		zap.String("player_name", req.PlayerName))
-	
+
 	player, err := s.icClient.GetPlayer(ctx, req.PlayerName)
 	if err != nil {
 		s.logger.Warn("Failed to fetch player from IdleClans API",
@@ -1101,8 +1110,8 @@ func (s *Server) handleSendPlanToDiscord(w http.ResponseWriter, r *http.Request)
 	}
 
 	embed := &DiscordEmbed{
-		Title: "Time to do quests!",
-		Color: 0xe91e63, // Pink
+		Title:  "Time to do quests!",
+		Color:  0xe91e63, // Pink
 		Fields: fields,
 	}
 
@@ -1123,4 +1132,1017 @@ func (s *Server) handleSendPlanToDiscord(w http.ResponseWriter, r *http.Request)
 	json.NewEncoder(w).Encode(map[string]string{"status": "sent"})
 }
 
+// Screenshot analysis types and handlers
 
+// AnalyzeQuestsResponse represents the response from quest screenshot analysis
+type AnalyzeQuestsResponse struct {
+	Bosses  []BossKillResult `json:"bosses"`
+	Applied bool             `json:"applied"`
+	Error   string           `json:"error,omitempty"`
+}
+
+// ImageSplitInfo contains info about how the image was split
+type ImageSplitInfo struct {
+	OriginalWidth  int
+	OriginalHeight int
+	TileSize       int
+	TileCount      int
+}
+
+// splitImageIntoTiles splits a horizontal strip of key tiles into individual images
+// It auto-detects tile boundaries by assuming square tiles based on image height
+func splitImageIntoTiles(imgData []byte) ([][]byte, *ImageSplitInfo, error) {
+	img, _, err := image.Decode(bytes.NewReader(imgData))
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to decode image: %w", err)
+	}
+
+	bounds := img.Bounds()
+	height := bounds.Dy()
+	width := bounds.Dx()
+
+	// Calculate tile size - assume tiles are square
+	// First try: number of tiles = width / height (rounded)
+	numTiles := (width + height/2) / height
+	if numTiles < 1 {
+		numTiles = 1
+	}
+
+	// Calculate actual tile width
+	tileSize := width / numTiles
+
+	info := &ImageSplitInfo{
+		OriginalWidth:  width,
+		OriginalHeight: height,
+		TileSize:       tileSize,
+		TileCount:      numTiles,
+	}
+
+	var tiles [][]byte
+	for i := 0; i < numTiles; i++ {
+		x := bounds.Min.X + i*tileSize
+		tileMaxX := x + tileSize
+		if i == numTiles-1 {
+			// Last tile gets any remaining pixels
+			tileMaxX = bounds.Max.X
+		}
+
+		// Create subimage for this tile
+		tileRect := image.Rect(x, bounds.Min.Y, tileMaxX, bounds.Max.Y)
+
+		// Create a new image for the tile
+		tileImg := image.NewRGBA(image.Rect(0, 0, tileRect.Dx(), tileRect.Dy()))
+		for ty := 0; ty < tileRect.Dy(); ty++ {
+			for tx := 0; tx < tileRect.Dx(); tx++ {
+				tileImg.Set(tx, ty, img.At(tileRect.Min.X+tx, tileRect.Min.Y+ty))
+			}
+		}
+
+		// Encode tile to PNG
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, tileImg); err != nil {
+			return nil, nil, fmt.Errorf("failed to encode tile: %w", err)
+		}
+
+		tiles = append(tiles, buf.Bytes())
+	}
+
+	return tiles, info, nil
+}
+
+// singleKeyResponse represents the LLM response for a single key tile
+type singleKeyResponse struct {
+	Type  string `json:"type"`
+	Count int    `json:"count"`
+}
+
+// countResponse represents the LLM response with a count
+type countResponse struct {
+	Count int `json:"count"`
+}
+
+// splitImageIntoNTiles splits an image into exactly n equal-width tiles
+func splitImageIntoNTiles(imgData []byte, n int) ([][]byte, error) {
+	if n < 1 {
+		n = 1
+	}
+
+	img, _, err := image.Decode(bytes.NewReader(imgData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode image: %w", err)
+	}
+
+	bounds := img.Bounds()
+	width := bounds.Dx()
+	height := bounds.Dy()
+
+	tileWidth := width / n
+
+	var tiles [][]byte
+	for i := 0; i < n; i++ {
+		x := bounds.Min.X + i*tileWidth
+		maxX := x + tileWidth
+		if i == n-1 {
+			// Last tile gets any remaining pixels
+			maxX = bounds.Max.X
+		}
+
+		// Create tile image
+		tileImg := image.NewRGBA(image.Rect(0, 0, maxX-x, height))
+		for ty := 0; ty < height; ty++ {
+			for tx := 0; tx < maxX-x; tx++ {
+				tileImg.Set(tx, ty, img.At(x+tx, bounds.Min.Y+ty))
+			}
+		}
+
+		// Encode to PNG
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, tileImg); err != nil {
+			return nil, fmt.Errorf("failed to encode tile: %w", err)
+		}
+
+		tiles = append(tiles, buf.Bytes())
+	}
+
+	return tiles, nil
+}
+
+// cropImageToBox extracts a portion of an image given bounding box coordinates
+func cropImageToBox(imgData []byte, x, y, w, h int) ([]byte, error) {
+	img, _, err := image.Decode(bytes.NewReader(imgData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode image: %w", err)
+	}
+
+	bounds := img.Bounds()
+
+	// Validate and clamp coordinates
+	if x < bounds.Min.X {
+		x = bounds.Min.X
+	}
+	if y < bounds.Min.Y {
+		y = bounds.Min.Y
+	}
+	if x+w > bounds.Max.X {
+		w = bounds.Max.X - x
+	}
+	if y+h > bounds.Max.Y {
+		h = bounds.Max.Y - y
+	}
+
+	if w <= 0 || h <= 0 {
+		return nil, fmt.Errorf("invalid crop dimensions")
+	}
+
+	// Create cropped image
+	cropped := image.NewRGBA(image.Rect(0, 0, w, h))
+	for cy := 0; cy < h; cy++ {
+		for cx := 0; cx < w; cx++ {
+			cropped.Set(cx, cy, img.At(x+cx, y+cy))
+		}
+	}
+
+	// Encode to PNG
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, cropped); err != nil {
+		return nil, fmt.Errorf("failed to encode cropped image: %w", err)
+	}
+
+	return buf.Bytes(), nil
+}
+
+// BossKillResult represents a boss and its required kills from screenshot analysis
+type BossKillResult struct {
+	Name  string `json:"name"`
+	Kills int    `json:"kills"`
+}
+
+// AnalyzeKeysResponse represents the response from key screenshot analysis
+type AnalyzeKeysResponse struct {
+	Keys    []KeyCountResult `json:"keys"`
+	Applied bool             `json:"applied"`
+	Error   string           `json:"error,omitempty"`
+}
+
+// KeyCountResult represents a key type and its count from screenshot analysis
+type KeyCountResult struct {
+	Type  string `json:"type"`
+	Count int    `json:"count"`
+}
+
+// LLM response types for parsing
+type llmQuestResponse struct {
+	Bosses []struct {
+		Name  string `json:"name"`
+		Kills int    `json:"kills"`
+	} `json:"bosses"`
+}
+
+type llmKeyResponse struct {
+	Keys []struct {
+		Type  string `json:"type"`
+		Count int    `json:"count"`
+	} `json:"keys"`
+}
+
+const questAnalysisPrompt = `You are analyzing a screenshot from the game IdleClans showing a quest tracker.
+The quest tracker shows boss names and the number of kills required for each boss.
+
+Valid boss names are: griffin, medusa, hades, zeus, devil, chimera, dragon, sobek, kronos
+
+Extract the boss names and their required kill counts from the image.
+Return ONLY a JSON object in this exact format, with no other text:
+{"bosses": [{"name": "boss_name_lowercase", "kills": number}, ...]}
+
+Only include bosses that are visible in the screenshot with a kill requirement greater than 0.
+Use lowercase for boss names exactly as listed above.`
+
+// keyDescribePrompt asks the model to describe each key tile
+const keyDescribePrompt = `Look at this game inventory showing boss keys in a row.
+
+For EACH key tile from LEFT to RIGHT, describe:
+1. The key's COLOR (brown, gold, red, blue, green, gray, white, cyan)
+2. The key's SHAPE (simple house key OR ornate skeleton key)
+3. The NUMBER shown in orange (or "none" if no number)
+
+Format each key on its own line like this:
+Key 1: [COLOR] [SHAPE], number: [NUMBER]
+Key 2: [COLOR] [SHAPE], number: [NUMBER]
+...
+
+Be thorough - describe EVERY key tile you can see, from left to right.`
+
+// keyAnalysisPrompt is a simple single-pass prompt (used by authenticated endpoint)
+const keyAnalysisPrompt = `Analyze this key inventory screenshot. Return JSON with keys that have visible orange numbers.
+
+KEY COLORS: mountain=BROWN, godly=GOLD, burning=RED, underworld=DARK_BLUE, mutated=GREEN, stone=GRAY, ancient=WHITE, otherworldly=CYAN
+
+OUTPUT: {"keys":[{"type":"godly","count":19}]}`
+
+// keyParsePrompt converts the description to JSON
+const keyParsePrompt = `Convert this key description to JSON.
+
+KEY TYPE MAPPING:
+- brown/tan key = "mountain"
+- gold/yellow key = "godly"
+- red key = "burning"
+- dark blue house key = "underworld"
+- green key = "mutated"
+- gray/silver key = "stone"
+- white skeleton key = "ancient"
+- cyan/light blue skeleton key = "otherworldly"
+
+RULES:
+1. Only include keys that have a number (skip "none")
+2. Each key type can only appear once
+3. Return ONLY valid JSON, no other text
+
+OUTPUT FORMAT:
+{"keys":[{"type":"godly","count":19},{"type":"stone","count":41}]}`
+
+// singleKeyAnalysisPrompt is used when analyzing one key tile at a time
+const singleKeyAnalysisPrompt = `Identify this game key icon.
+
+KEY COLORS: mountain=BROWN, godly=GOLD, burning=RED, underworld=DARK_BLUE, mutated=GREEN, stone=GRAY, ancient=WHITE, otherworldly=CYAN
+
+Look at the key color and the orange number (if any).
+
+OUTPUT FORMAT - respond with ONLY this, no other text:
+{"type":"X","count":N}
+
+Replace X with key type, N with number (use 0 if no number shown).
+
+VALID RESPONSES:
+{"type":"godly","count":19}
+{"type":"stone","count":41}
+{"type":"burning","count":0}`
+
+// countKeysPrompt asks the LLM to count visible key tiles
+const countKeysPrompt = `Count the number of key icons visible in this game inventory image.
+
+The keys are displayed in a horizontal row. Each key is in its own square tile.
+
+Return ONLY a JSON object with the count:
+{"count":7}
+
+Count ALL visible key tiles, whether or not they have a number shown.`
+
+// handleAnalyzeQuests analyzes a quest screenshot and extracts boss kill requirements
+func (s *Server) handleAnalyzeQuests(w http.ResponseWriter, r *http.Request) {
+	session := getSession(r)
+	if session == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	if s.ollamaClient == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(AnalyzeQuestsResponse{Error: "Image analysis not configured"})
+		return
+	}
+
+	// Parse multipart form (max 10MB)
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(AnalyzeQuestsResponse{Error: "Failed to parse form: " + err.Error()})
+		return
+	}
+
+	// Get the image file
+	file, header, err := r.FormFile("image")
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(AnalyzeQuestsResponse{Error: "No image file provided"})
+		return
+	}
+	defer file.Close()
+
+	// Read the image data
+	imageData, err := io.ReadAll(file)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AnalyzeQuestsResponse{Error: "Failed to read image"})
+		return
+	}
+
+	// Determine image type
+	imageType := header.Header.Get("Content-Type")
+	if imageType == "" {
+		imageType = "image/png" // Default to PNG
+	}
+
+	// Encode to base64
+	imageBase64 := base64.StdEncoding.EncodeToString(imageData)
+
+	// Call LLM
+	resp, err := s.ollamaClient.ChatCompletionWithImage(
+		s.config.OllamaModel,
+		questAnalysisPrompt,
+		"Please analyze this quest tracker screenshot and extract the boss kill requirements.",
+		imageBase64,
+		imageType,
+	)
+	if err != nil {
+		s.logger.Error("Failed to analyze quest screenshot", zap.Error(err))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AnalyzeQuestsResponse{Error: "Failed to analyze image: " + err.Error()})
+		return
+	}
+
+	// Parse LLM response
+	content := extractJSON(resp.Choices[0].Message.Content)
+	var llmResp llmQuestResponse
+	if err := json.Unmarshal([]byte(content), &llmResp); err != nil {
+		s.logger.Error("Failed to parse LLM response",
+			zap.Error(err),
+			zap.String("content", resp.Choices[0].Message.Content))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AnalyzeQuestsResponse{Error: "Failed to parse analysis result"})
+		return
+	}
+
+	// Validate and convert results
+	results := make([]BossKillResult, 0)
+	for _, b := range llmResp.Bosses {
+		bossName := strings.ToLower(strings.TrimSpace(b.Name))
+		if quests.IsValidBoss(bossName) && b.Kills > 0 {
+			results = append(results, BossKillResult{
+				Name:  bossName,
+				Kills: b.Kills,
+			})
+		}
+	}
+
+	response := AnalyzeQuestsResponse{
+		Bosses:  results,
+		Applied: false,
+	}
+
+	// Check if we should apply the results
+	if r.URL.Query().Get("apply") == "true" {
+		playerName := r.URL.Query().Get("player")
+		if playerName == "" {
+			// Use the user's main player name
+			playerName, err = s.db.GetPlayerName(r.Context(), session.UserID)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(AnalyzeQuestsResponse{
+					Bosses: results,
+					Error:  "No player specified and no main player registered",
+				})
+				return
+			}
+		}
+
+		// Verify the player belongs to this user
+		if !s.userOwnsPlayer(r.Context(), session.UserID, playerName) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(AnalyzeQuestsResponse{
+				Bosses: results,
+				Error:  "You don't own this player",
+			})
+			return
+		}
+
+		// Apply the quest updates
+		week, year := getWeekAndYear()
+		for _, boss := range results {
+			if err := s.db.UpsertQuest(r.Context(), session.UserID, playerName, week, year, boss.Name, boss.Kills); err != nil {
+				s.logger.Error("Failed to apply quest update",
+					zap.Error(err),
+					zap.String("boss", boss.Name),
+					zap.Int("kills", boss.Kills))
+			}
+		}
+
+		response.Applied = true
+		s.NotifyDataChange("quest")
+
+		s.logger.Info("Applied quest updates from screenshot",
+			zap.String("user_id", session.UserID),
+			zap.String("player", playerName),
+			zap.Int("bosses_updated", len(results)))
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// handleAnalyzeKeys analyzes a key inventory screenshot and extracts key counts
+func (s *Server) handleAnalyzeKeys(w http.ResponseWriter, r *http.Request) {
+	session := getSession(r)
+	if session == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	if s.ollamaClient == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Image analysis not configured"})
+		return
+	}
+
+	// Parse multipart form (max 10MB)
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Failed to parse form: " + err.Error()})
+		return
+	}
+
+	// Get the image file
+	file, header, err := r.FormFile("image")
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "No image file provided"})
+		return
+	}
+	defer file.Close()
+
+	// Read the image data
+	imageData, err := io.ReadAll(file)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Failed to read image"})
+		return
+	}
+
+	// Determine image type
+	imageType := header.Header.Get("Content-Type")
+	if imageType == "" {
+		imageType = "image/png" // Default to PNG
+	}
+
+	// Encode to base64
+	imageBase64 := base64.StdEncoding.EncodeToString(imageData)
+
+	// Call LLM
+	resp, err := s.ollamaClient.ChatCompletionWithImage(
+		s.config.OllamaModel,
+		keyAnalysisPrompt,
+		"Please analyze this key inventory screenshot and extract the key counts.",
+		imageBase64,
+		imageType,
+	)
+	if err != nil {
+		s.logger.Error("Failed to analyze key screenshot", zap.Error(err))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Failed to analyze image: " + err.Error()})
+		return
+	}
+
+	// Parse LLM response
+	content := extractJSON(resp.Choices[0].Message.Content)
+	var llmResp llmKeyResponse
+	if err := json.Unmarshal([]byte(content), &llmResp); err != nil {
+		s.logger.Error("Failed to parse LLM response",
+			zap.Error(err),
+			zap.String("content", resp.Choices[0].Message.Content))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Failed to parse analysis result"})
+		return
+	}
+
+	// Validate and convert results
+	results := make([]KeyCountResult, 0)
+	for _, k := range llmResp.Keys {
+		keyType, ok := quests.ResolveKeyType(k.Type)
+		if ok && k.Count > 0 {
+			results = append(results, KeyCountResult{
+				Type:  keyType,
+				Count: k.Count,
+			})
+		}
+	}
+
+	response := AnalyzeKeysResponse{
+		Keys:    results,
+		Applied: false,
+	}
+
+	// Check if we should apply the results
+	if r.URL.Query().Get("apply") == "true" {
+		playerName := r.URL.Query().Get("player")
+		if playerName == "" {
+			// Use the user's main player name
+			playerName, err = s.db.GetPlayerName(r.Context(), session.UserID)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(AnalyzeKeysResponse{
+					Keys:  results,
+					Error: "No player specified and no main player registered",
+				})
+				return
+			}
+		}
+
+		// Verify the player belongs to this user
+		if !s.userOwnsPlayer(r.Context(), session.UserID, playerName) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(AnalyzeKeysResponse{
+				Keys:  results,
+				Error: "You don't own this player",
+			})
+			return
+		}
+
+		// Apply the key updates
+		for _, key := range results {
+			if err := s.db.UpsertPlayerKeys(r.Context(), playerName, key.Type, key.Count); err != nil {
+				s.logger.Error("Failed to apply key update",
+					zap.Error(err),
+					zap.String("key_type", key.Type),
+					zap.Int("count", key.Count))
+			}
+		}
+
+		response.Applied = true
+		s.NotifyDataChange("keys")
+
+		s.logger.Info("Applied key updates from screenshot",
+			zap.String("user_id", session.UserID),
+			zap.String("player", playerName),
+			zap.Int("keys_updated", len(results)))
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// extractJSON attempts to extract a JSON object from a string that might contain extra text
+func extractJSON(s string) string {
+	// Find the first { and last }
+	start := strings.Index(s, "{")
+	end := strings.LastIndex(s, "}")
+	if start >= 0 && end > start {
+		return s[start : end+1]
+	}
+	return s
+}
+
+// cleanKeyJSON attempts to fix common JSON issues in LLM responses
+func cleanKeyJSON(s string) string {
+	// First extract the JSON
+	s = extractJSON(s)
+
+	// Try to parse as-is first
+	var test llmKeyResponse
+	if json.Unmarshal([]byte(s), &test) == nil {
+		return s
+	}
+
+	// Find the keys array and extract just the valid entries
+	keysStart := strings.Index(s, `"keys"`)
+	if keysStart < 0 {
+		return s
+	}
+
+	arrayStart := strings.Index(s[keysStart:], "[")
+	if arrayStart < 0 {
+		return s
+	}
+	arrayStart += keysStart
+
+	// Find matching ]
+	depth := 0
+	arrayEnd := -1
+	for i := arrayStart; i < len(s); i++ {
+		if s[i] == '[' {
+			depth++
+		} else if s[i] == ']' {
+			depth--
+			if depth == 0 {
+				arrayEnd = i
+				break
+			}
+		}
+	}
+
+	if arrayEnd < 0 {
+		return s
+	}
+
+	// Extract individual key objects
+	arrayContent := s[arrayStart+1 : arrayEnd]
+	var validKeys []string
+
+	// Find each {...} object
+	objStart := -1
+	depth = 0
+	for i := 0; i < len(arrayContent); i++ {
+		if arrayContent[i] == '{' {
+			if depth == 0 {
+				objStart = i
+			}
+			depth++
+		} else if arrayContent[i] == '}' {
+			depth--
+			if depth == 0 && objStart >= 0 {
+				obj := arrayContent[objStart : i+1]
+				// Try to parse this object
+				var keyObj struct {
+					Type  string `json:"type"`
+					Count int    `json:"count"`
+				}
+				if json.Unmarshal([]byte(obj), &keyObj) == nil && keyObj.Type != "" {
+					validKeys = append(validKeys, obj)
+				}
+				objStart = -1
+			}
+		}
+	}
+
+	if len(validKeys) > 0 {
+		return `{"keys":[` + strings.Join(validKeys, ",") + `]}`
+	}
+
+	return s
+}
+
+// parseKeyResponseFallback tries to extract key type and count from verbose LLM responses
+func parseKeyResponseFallback(content string) *singleKeyResponse {
+	content = strings.ToLower(content)
+
+	// List of key types to look for
+	keyTypes := []string{"mountain", "godly", "burning", "underworld", "mutated", "stone", "ancient", "otherworldly"}
+
+	var foundType string
+	for _, kt := range keyTypes {
+		if strings.Contains(content, kt) {
+			foundType = kt
+			break
+		}
+	}
+
+	if foundType == "" {
+		return nil
+	}
+
+	// Try to find a number - look for patterns like "41", "count": 41, "count is 5"
+	var foundCount int
+	// Look for numbers in the text
+	words := strings.Fields(content)
+	for _, word := range words {
+		// Clean the word of punctuation
+		cleaned := strings.Trim(word, ".,;:\"'()")
+		if n, err := strconv.Atoi(cleaned); err == nil && n > 0 && n < 1000 {
+			foundCount = n
+			break
+		}
+	}
+
+	return &singleKeyResponse{
+		Type:  foundType,
+		Count: foundCount,
+	}
+}
+
+// Admin versions of analyze handlers (no auth required - internal network only)
+
+// handleAdminAnalyzeQuests is the admin version that doesn't require authentication
+func (s *Server) handleAdminAnalyzeQuests(w http.ResponseWriter, r *http.Request) {
+	// Same logic as handleAnalyzeQuests but without auth check
+	if s.ollamaClient == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(AnalyzeQuestsResponse{Error: "Image analysis not configured"})
+		return
+	}
+
+	// Parse multipart form (max 10MB)
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(AnalyzeQuestsResponse{Error: "Failed to parse form: " + err.Error()})
+		return
+	}
+
+	// Get the image file
+	file, header, err := r.FormFile("image")
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(AnalyzeQuestsResponse{Error: "No image file provided"})
+		return
+	}
+	defer file.Close()
+
+	// Read the image data
+	imageData, err := io.ReadAll(file)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AnalyzeQuestsResponse{Error: "Failed to read image"})
+		return
+	}
+
+	// Determine image type
+	imageType := header.Header.Get("Content-Type")
+	if imageType == "" {
+		imageType = "image/png" // Default to PNG
+	}
+
+	// Encode to base64
+	imageBase64 := base64.StdEncoding.EncodeToString(imageData)
+
+	// Call LLM
+	resp, err := s.ollamaClient.ChatCompletionWithImage(
+		s.config.OllamaModel,
+		questAnalysisPrompt,
+		"Please analyze this quest tracker screenshot and extract the boss kill requirements.",
+		imageBase64,
+		imageType,
+	)
+	if err != nil {
+		s.logger.Error("Failed to analyze quest screenshot", zap.Error(err))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AnalyzeQuestsResponse{Error: "Failed to analyze image: " + err.Error()})
+		return
+	}
+
+	// Parse LLM response
+	content := extractJSON(resp.Choices[0].Message.Content)
+	var llmResp llmQuestResponse
+	if err := json.Unmarshal([]byte(content), &llmResp); err != nil {
+		s.logger.Error("Failed to parse LLM response",
+			zap.Error(err),
+			zap.String("content", resp.Choices[0].Message.Content))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AnalyzeQuestsResponse{Error: "Failed to parse analysis result"})
+		return
+	}
+
+	// Validate and convert results
+	results := make([]BossKillResult, 0)
+	for _, b := range llmResp.Bosses {
+		bossName := strings.ToLower(strings.TrimSpace(b.Name))
+		if quests.IsValidBoss(bossName) && b.Kills > 0 {
+			results = append(results, BossKillResult{
+				Name:  bossName,
+				Kills: b.Kills,
+			})
+		}
+	}
+
+	response := AnalyzeQuestsResponse{
+		Bosses:  results,
+		Applied: false,
+	}
+
+	// Admin version doesn't auto-apply, just returns results
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// handleAdminAnalyzeKeys is the admin version that doesn't require authentication
+// It analyzes the full image in a single pass
+func (s *Server) handleAdminAnalyzeKeys(w http.ResponseWriter, r *http.Request) {
+	if s.ollamaClient == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Image analysis not configured"})
+		return
+	}
+
+	// Parse multipart form (max 10MB)
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Failed to parse form: " + err.Error()})
+		return
+	}
+
+	// Get the image file
+	file, _, err := r.FormFile("image")
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "No image file provided"})
+		return
+	}
+	defer file.Close()
+
+	// Read the image data
+	imageData, err := io.ReadAll(file)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Failed to read image"})
+		return
+	}
+
+	// Get image dimensions for logging
+	img, _, _ := image.Decode(bytes.NewReader(imageData))
+	var imgWidth, imgHeight int
+	if img != nil {
+		imgWidth = img.Bounds().Dx()
+		imgHeight = img.Bounds().Dy()
+	}
+
+	s.logger.Info("Starting key analysis",
+		zap.Int("img_width", imgWidth),
+		zap.Int("img_height", imgHeight))
+
+	imageBase64 := base64.StdEncoding.EncodeToString(imageData)
+
+	// PASS 1: Ask the model to describe what it sees
+	descResp, err := s.ollamaClient.ChatCompletionWithImage(
+		s.config.OllamaModel,
+		keyDescribePrompt,
+		"Describe each key tile from left to right.",
+		imageBase64,
+		"image/png",
+	)
+	if err != nil {
+		s.logger.Error("Failed to describe keys", zap.Error(err))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Failed to analyze image: " + err.Error()})
+		return
+	}
+
+	description := descResp.Choices[0].Message.Content
+	s.logger.Info("Pass 1 - Key description", zap.String("description", description))
+
+	// PASS 2: Parse the description into JSON using a text-only call
+	parseMessages := []ollama.ChatMessage{
+		{Role: "system", Content: keyParsePrompt},
+		{Role: "user", Content: "Here is the key description:\n\n" + description + "\n\nConvert this to JSON format."},
+	}
+
+	parseResp, err := s.ollamaClient.ChatCompletion(parseMessages)
+	if err != nil {
+		s.logger.Error("Failed to parse description", zap.Error(err))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Failed to parse description: " + err.Error()})
+		return
+	}
+
+	rawContent := parseResp.Choices[0].Message.Content
+	content := cleanKeyJSON(rawContent)
+
+	s.logger.Info("Pass 2 - Parsed JSON",
+		zap.String("raw", rawContent),
+		zap.String("cleaned", content))
+
+	var llmResp llmKeyResponse
+	if err := json.Unmarshal([]byte(content), &llmResp); err != nil {
+		s.logger.Error("Failed to parse JSON response",
+			zap.Error(err),
+			zap.String("raw", rawContent),
+			zap.String("cleaned", content))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Failed to parse analysis result"})
+		return
+	}
+
+	// Validate and convert results
+	results := make([]KeyCountResult, 0)
+	for _, k := range llmResp.Keys {
+		keyType, ok := quests.ResolveKeyType(k.Type)
+		if ok && k.Count > 0 {
+			results = append(results, KeyCountResult{
+				Type:  keyType,
+				Count: k.Count,
+			})
+		}
+	}
+
+	s.logger.Info("Key analysis complete", zap.Int("keys_found", len(results)))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(AnalyzeKeysResponse{Keys: results, Applied: false})
+}
+
+// analyzeKeyTiles analyzes a slice of key tile images and returns the results
+func (s *Server) analyzeKeyTiles(tiles [][]byte, splitInfo *ImageSplitInfo) []KeyCountResult {
+	if splitInfo != nil {
+		s.logger.Info("Analyzing tiles",
+			zap.Int("tile_count", len(tiles)),
+			zap.Int("tile_size", splitInfo.TileSize))
+	} else {
+		s.logger.Info("Analyzing tiles", zap.Int("tile_count", len(tiles)))
+	}
+
+	results := make([]KeyCountResult, 0)
+	for i, tileData := range tiles {
+		tileBase64 := base64.StdEncoding.EncodeToString(tileData)
+
+		resp, err := s.ollamaClient.ChatCompletionWithImageJSON(
+			s.config.OllamaModel,
+			singleKeyAnalysisPrompt,
+			"Identify the key type and count.",
+			tileBase64,
+			"image/png",
+			true, // Force JSON output
+		)
+		if err != nil {
+			s.logger.Warn("Failed to analyze tile",
+				zap.Int("tile", i),
+				zap.Error(err))
+			continue
+		}
+
+		// Parse the response - try JSON first, then fallback
+		rawContent := resp.Choices[0].Message.Content
+		content := extractJSON(rawContent)
+		var keyResp *singleKeyResponse
+
+		var parsed singleKeyResponse
+		if err := json.Unmarshal([]byte(content), &parsed); err != nil {
+			// JSON parsing failed, try fallback parser
+			keyResp = parseKeyResponseFallback(rawContent)
+			if keyResp != nil {
+				s.logger.Info("Used fallback parser for tile",
+					zap.Int("tile", i),
+					zap.String("type", keyResp.Type),
+					zap.Int("count", keyResp.Count),
+					zap.String("raw", rawContent))
+			} else {
+				s.logger.Warn("Failed to parse tile response",
+					zap.Int("tile", i),
+					zap.Error(err),
+					zap.String("content", rawContent))
+				continue
+			}
+		} else {
+			keyResp = &parsed
+			s.logger.Info("Analyzed tile",
+				zap.Int("tile", i),
+				zap.String("type", keyResp.Type),
+				zap.Int("count", keyResp.Count))
+		}
+
+		// Only add if we got a valid key type and count > 0
+		if keyResp != nil && keyResp.Count > 0 {
+			keyType, ok := quests.ResolveKeyType(keyResp.Type)
+			if ok {
+				results = append(results, KeyCountResult{
+					Type:  keyType,
+					Count: keyResp.Count,
+				})
+			}
+		}
+	}
+
+	return results
+}

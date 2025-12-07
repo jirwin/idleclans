@@ -3,6 +3,7 @@ import type { PlayerData } from '../types';
 import { BOSSES, KEY_TYPES } from '../types';
 import { fetchAllPlayers, adminUpdateQuest, adminUpdateKeys, checkAdminAccess, adminUnregisterPlayer, adminDeletePlayer } from '../api';
 import { useSSE } from '../hooks/useSSE';
+import { ScreenshotAnalyzer } from '../components/ScreenshotAnalyzer';
 
 export function Admin() {
   const [players, setPlayers] = useState<PlayerData[]>([]);
@@ -13,6 +14,7 @@ export function Admin() {
   const [searchTerm, setSearchTerm] = useState('');
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [showAnalyzer, setShowAnalyzer] = useState(false);
 
   const loadPlayers = useCallback(async (showRefreshIndicator = false) => {
     if (showRefreshIndicator) {
@@ -185,7 +187,26 @@ export function Admin() {
               This admin panel should only be accessible on internal networks.
             </p>
           </div>
+          <div className="mt-4 flex gap-2">
+            <button
+              onClick={() => setShowAnalyzer(!showAnalyzer)}
+              className={`px-4 py-2 rounded-lg transition-colors flex items-center gap-2 ${
+                showAnalyzer
+                  ? 'bg-violet-600 hover:bg-violet-700 text-white'
+                  : 'bg-[var(--color-bg-card)] border border-[var(--color-border)] text-gray-300 hover:text-white'
+              }`}
+            >
+              <span>📸</span>
+              <span>Screenshot Analyzer</span>
+            </button>
+          </div>
         </header>
+
+        {showAnalyzer && (
+          <div className="mb-6">
+            <ScreenshotAnalyzer />
+          </div>
+        )}
 
         <div className="grid gap-6 lg:grid-cols-3">
           {/* Player List */}
