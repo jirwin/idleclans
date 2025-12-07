@@ -1,4 +1,4 @@
-import type { UserData, PlayerData } from './types';
+import type { UserData, PlayerData, ClanBossData, ClanKeysData, PlanData } from './types';
 
 const API_BASE = '/api';
 
@@ -53,6 +53,141 @@ export async function logout(): Promise<void> {
     method: 'POST',
     credentials: 'include',
   });
+}
+
+export interface RegisterResponse {
+  success: boolean;
+  message?: string;
+  error?: string;
+}
+
+export async function registerPlayer(playerName: string): Promise<RegisterResponse> {
+  const res = await fetch(`${API_BASE}/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ player_name: playerName }),
+  });
+  
+  return res.json();
+}
+
+export interface AltResponse {
+  status?: string;
+  message?: string;
+  error?: string;
+}
+
+export async function addAlt(playerName: string): Promise<AltResponse> {
+  const res = await fetch(`${API_BASE}/alts`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ player_name: playerName }),
+  });
+  
+  return res.json();
+}
+
+export async function removeAlt(playerName: string): Promise<AltResponse> {
+  const res = await fetch(`${API_BASE}/alts/${encodeURIComponent(playerName)}`, {
+    method: 'DELETE',
+    credentials: 'include',
+  });
+  
+  return res.json();
+}
+
+// Clan view API functions
+
+export async function fetchClanBosses(): Promise<ClanBossData> {
+  const res = await fetch(`${API_BASE}/clan/bosses`, {
+    credentials: 'include',
+  });
+  
+  if (res.status === 401) {
+    throw new Error('Unauthorized');
+  }
+  
+  if (!res.ok) {
+    throw new Error(`Failed to fetch clan bosses: ${res.statusText}`);
+  }
+  
+  return res.json();
+}
+
+export async function fetchClanKeys(): Promise<ClanKeysData> {
+  const res = await fetch(`${API_BASE}/clan/keys`, {
+    credentials: 'include',
+  });
+  
+  if (res.status === 401) {
+    throw new Error('Unauthorized');
+  }
+  
+  if (!res.ok) {
+    throw new Error(`Failed to fetch clan keys: ${res.statusText}`);
+  }
+  
+  return res.json();
+}
+
+export async function fetchClanPlan(onlinePlayers?: string[]): Promise<PlanData> {
+  const res = await fetch(`${API_BASE}/clan/plan`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ online_players: onlinePlayers || [] }),
+  });
+  
+  if (res.status === 401) {
+    throw new Error('Unauthorized');
+  }
+  
+  if (!res.ok) {
+    throw new Error(`Failed to fetch plan: ${res.statusText}`);
+  }
+  
+  return res.json();
+}
+
+export async function fetchClanPlayers(): Promise<string[]> {
+  const res = await fetch(`${API_BASE}/clan/players`, {
+    credentials: 'include',
+  });
+  
+  if (res.status === 401) {
+    throw new Error('Unauthorized');
+  }
+  
+  if (!res.ok) {
+    throw new Error(`Failed to fetch players: ${res.statusText}`);
+  }
+  
+  const data = await res.json();
+  return data.players || [];
+}
+
+export async function sendPlanToDiscord(players: string[]): Promise<void> {
+  const res = await fetch(`${API_BASE}/clan/plan/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ players }),
+  });
+  
+  if (res.status === 401) {
+    throw new Error('Unauthorized');
+  }
+  
+  if (res.status === 503) {
+    throw new Error('Discord integration not configured');
+  }
+  
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `Failed to send to Discord: ${res.statusText}`);
+  }
 }
 
 // Admin API functions
@@ -125,6 +260,26 @@ export async function adminUpdateKeys(
   
   if (!res.ok) {
     throw new Error(`Failed to update keys: ${res.statusText}`);
+  }
+}
+
+export async function adminUnregisterPlayer(discordId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/players/${discordId}/unregister`, {
+    method: 'POST',
+  });
+  
+  if (!res.ok) {
+    throw new Error(`Failed to unregister player: ${res.statusText}`);
+  }
+}
+
+export async function adminDeletePlayer(discordId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/players/${discordId}`, {
+    method: 'DELETE',
+  });
+  
+  if (!res.ok) {
+    throw new Error(`Failed to delete player: ${res.statusText}`);
   }
 }
 

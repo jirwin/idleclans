@@ -24,6 +24,53 @@ export interface PlayerData {
   keys: Record<string, number>;
 }
 
+// Clan view types
+export interface ClanBossEntry {
+  player_name: string;
+  remaining_kills: number;
+}
+
+export interface ClanBossData {
+  week: number;
+  year: number;
+  bosses: Record<string, ClanBossEntry[]>;
+}
+
+export interface ClanKeyEntry {
+  player_name: string;
+  count: number;
+}
+
+export interface ClanKeysData {
+  keys: Record<string, ClanKeyEntry[]>;
+}
+
+// Plan types
+export interface PlanPartyTask {
+  boss_name: string;
+  kills: number;
+  key_holder?: string;
+  key_type: string;
+  no_keys: boolean;
+}
+
+export interface PlanParty {
+  players: string[];
+  tasks: PlanPartyTask[];
+}
+
+export interface PlanLeftover {
+  player_name: string;
+  needs: Record<string, number>;
+}
+
+export interface PlanData {
+  week: number;
+  year: number;
+  parties: PlanParty[];
+  leftovers: PlanLeftover[];
+}
+
 export const BOSSES = [
   { name: 'griffin', key: 'mountain', color: '#8B4513', label: 'Griffin' },
   { name: 'medusa', key: 'stone', color: '#808080', label: 'Medusa' },

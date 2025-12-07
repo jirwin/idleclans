@@ -13,6 +13,7 @@ export function QuestCard({ playerName, quests, onUpdateQuest, isAdmin }: QuestC
   const [editingBoss, setEditingBoss] = useState<string | null>(null);
   const [editValue, setEditValue] = useState('');
   const [saving, setSaving] = useState(false);
+  const [completingBoss, setCompletingBoss] = useState<string | null>(null);
 
   const getQuestForBoss = (bossName: string) => {
     return quests.find((q) => q.boss_name === bossName);
@@ -35,6 +36,17 @@ export function QuestCard({ playerName, quests, onUpdateQuest, isAdmin }: QuestC
       console.error('Failed to update quest:', error);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleComplete = async (bossName: string) => {
+    setCompletingBoss(bossName);
+    try {
+      await onUpdateQuest(playerName, bossName, 0);
+    } catch (error) {
+      console.error('Failed to complete quest:', error);
+    } finally {
+      setCompletingBoss(null);
     }
   };
 
@@ -86,7 +98,7 @@ export function QuestCard({ playerName, quests, onUpdateQuest, isAdmin }: QuestC
                       value={editValue}
                       onChange={(e) => setEditValue(e.target.value)}
                       onKeyDown={(e) => handleKeyDown(e, boss.name)}
-                      onBlur={() => handleSave(boss.name)}
+                      onFocus={(e) => e.target.select()}
                       className="w-20 px-3 py-2 text-base bg-[var(--color-bg-dark)] border border-violet-500 rounded-lg text-white text-center focus:outline-none focus:ring-2 focus:ring-violet-500"
                       min="0"
                       autoFocus
@@ -116,9 +128,25 @@ export function QuestCard({ playerName, quests, onUpdateQuest, isAdmin }: QuestC
                     >
                       {remaining > 0 ? remaining : '—'}
                     </span>
+                    {remaining > 0 && (
+                      <button
+                        onClick={() => handleComplete(boss.name)}
+                        disabled={completingBoss === boss.name}
+                        className="p-2 text-gray-500 hover:text-emerald-400 active:text-emerald-500 transition-colors disabled:opacity-50"
+                        title="Mark as complete"
+                      >
+                        {completingBoss === boss.name ? (
+                          <div className="w-5 h-5 border-2 border-current border-t-transparent rounded-full animate-spin" />
+                        ) : (
+                          <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                          </svg>
+                        )}
+                      </button>
+                    )}
                     <button
                       onClick={() => handleEdit(boss.name, quest?.required_kills ?? 0)}
-                      className="p-3 -m-2 text-gray-500 hover:text-violet-400 active:text-violet-500 transition-colors"
+                      className="p-2 text-gray-500 hover:text-violet-400 active:text-violet-500 transition-colors"
                       title="Edit"
                     >
                       <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">

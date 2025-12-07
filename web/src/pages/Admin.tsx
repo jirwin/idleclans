@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import type { PlayerData } from '../types';
 import { BOSSES, KEY_TYPES } from '../types';
-import { fetchAllPlayers, adminUpdateQuest, adminUpdateKeys, checkAdminAccess } from '../api';
+import { fetchAllPlayers, adminUpdateQuest, adminUpdateKeys, checkAdminAccess, adminUnregisterPlayer, adminDeletePlayer } from '../api';
 import { useSSE } from '../hooks/useSSE';
 
 export function Admin() {
@@ -247,6 +247,20 @@ export function Admin() {
                 player={selectedPlayer}
                 onUpdateQuest={handleUpdateQuest}
                 onUpdateKeys={handleUpdateKeys}
+                onUnregister={async () => {
+                  if (!selectedPlayer.is_alt && confirm(`Unregister ${selectedPlayer.player_name}? They will need to re-register with their character name.`)) {
+                    await adminUnregisterPlayer(selectedPlayer.discord_id);
+                    setSelectedPlayer(null);
+                    await loadPlayers();
+                  }
+                }}
+                onDelete={async () => {
+                  if (!selectedPlayer.is_alt && confirm(`DELETE ${selectedPlayer.player_name} and ALL their data (quests, keys, alts)? This cannot be undone!`)) {
+                    await adminDeletePlayer(selectedPlayer.discord_id);
+                    setSelectedPlayer(null);
+                    await loadPlayers();
+                  }
+                }}
                 onRefresh={loadPlayers}
               />
             ) : (
@@ -266,10 +280,12 @@ interface PlayerDetailsProps {
   player: PlayerData;
   onUpdateQuest: (discordId: string, playerName: string, boss: string, kills: number) => Promise<void>;
   onUpdateKeys: (discordId: string, playerName: string, keyType: string, count: number) => Promise<void>;
+  onUnregister: () => Promise<void>;
+  onDelete: () => Promise<void>;
   onRefresh: () => Promise<void>;
 }
 
-function PlayerDetails({ player, onUpdateQuest, onUpdateKeys, onRefresh }: PlayerDetailsProps) {
+function PlayerDetails({ player, onUpdateQuest, onUpdateKeys, onUnregister, onDelete, onRefresh }: PlayerDetailsProps) {
   const [editingQuest, setEditingQuest] = useState<string | null>(null);
   const [editingKey, setEditingKey] = useState<string | null>(null);
   const [editValue, setEditValue] = useState('');
@@ -315,7 +331,7 @@ function PlayerDetails({ player, onUpdateQuest, onUpdateKeys, onRefresh }: Playe
     <div className="space-y-6">
       {/* Player Info */}
       <div className="bg-[var(--color-bg-card)] rounded-xl border border-[var(--color-border)] p-4">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between mb-3">
           <div>
             <h2 className="text-xl font-bold text-white flex items-center gap-2">
               {player.player_name}
@@ -345,6 +361,24 @@ function PlayerDetails({ player, onUpdateQuest, onUpdateKeys, onRefresh }: Playe
             </div>
           )}
         </div>
+        
+        {/* Admin Actions */}
+        {!player.is_alt && (
+          <div className="flex gap-2 pt-3 border-t border-[var(--color-border)]">
+            <button
+              onClick={onUnregister}
+              className="px-3 py-1.5 text-xs text-amber-400 hover:text-amber-300 border border-amber-700 hover:border-amber-600 rounded transition-colors"
+            >
+              🔓 Unregister
+            </button>
+            <button
+              onClick={onDelete}
+              className="px-3 py-1.5 text-xs text-red-400 hover:text-red-300 border border-red-700 hover:border-red-600 rounded transition-colors"
+            >
+              🗑️ Delete All Data
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Quests */}

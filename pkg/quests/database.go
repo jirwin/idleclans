@@ -180,6 +180,52 @@ func (d *DB) GetPlayerName(ctx context.Context, discordUserID string) (string, e
 	return playerName, nil
 }
 
+// UnregisterPlayer removes the player registration for a Discord user (keeps other data)
+func (d *DB) UnregisterPlayer(ctx context.Context, discordUserID string) error {
+	l := ctxzap.Extract(ctx)
+	l.Info("Unregistering player", zap.String("discord_user_id", discordUserID))
+
+	query := `DELETE FROM players WHERE discord_user_id = ?`
+	_, err := d.db.ExecContext(ctx, query, discordUserID)
+	return err
+}
+
+// DeletePlayer removes all data for a Discord user (player, alts, keys, quests)
+func (d *DB) DeletePlayer(ctx context.Context, discordUserID string) error {
+	l := ctxzap.Extract(ctx)
+	l.Info("Deleting player and all associated data", zap.String("discord_user_id", discordUserID))
+
+	// Get player name first to clean up player_keys
+	playerName, _ := d.GetPlayerName(ctx, discordUserID)
+	alts, _ := d.GetAlts(ctx, discordUserID)
+
+	// Delete in order to respect any foreign key constraints
+	// Delete player keys for main and alts
+	if playerName != "" {
+		_, _ = d.db.ExecContext(ctx, `DELETE FROM player_keys WHERE player_name = ?`, playerName)
+	}
+	for _, alt := range alts {
+		_, _ = d.db.ExecContext(ctx, `DELETE FROM player_keys WHERE player_name = ?`, alt)
+	}
+
+	// Delete quests
+	_, _ = d.db.ExecContext(ctx, `DELETE FROM weekly_quests WHERE discord_user_id = ?`, discordUserID)
+
+	// Delete quest kills
+	_, _ = d.db.ExecContext(ctx, `DELETE FROM quest_kills WHERE discord_user_id = ?`, discordUserID)
+
+	// Delete alts
+	_, _ = d.db.ExecContext(ctx, `DELETE FROM player_alts WHERE discord_user_id = ?`, discordUserID)
+
+	// Delete player registration
+	_, err := d.db.ExecContext(ctx, `DELETE FROM players WHERE discord_user_id = ?`, discordUserID)
+
+	// Delete sessions
+	_, _ = d.db.ExecContext(ctx, `DELETE FROM web_sessions WHERE user_id = ?`, discordUserID)
+
+	return err
+}
+
 // WeeklyQuestRow represents a row in the weekly_quests table
 type WeeklyQuestRow struct {
 	ID               int    `db:"id"`
@@ -684,6 +730,43 @@ func (d *DB) GetAllPlayers(ctx context.Context) ([]PlayerRow, error) {
 		return nil, err
 	}
 	return players, nil
+}
+
+// GetAllRegisteredPlayerNames returns all registered player names (main characters and alts)
+func (d *DB) GetAllRegisteredPlayerNames(ctx context.Context) ([]string, error) {
+	// Get main characters
+	mainQuery := `SELECT player_name FROM players ORDER BY player_name`
+	var mainPlayers []string
+	err := d.db.SelectContext(ctx, &mainPlayers, mainQuery)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get alts
+	altQuery := `SELECT player_name FROM player_alts ORDER BY player_name`
+	var altPlayers []string
+	err = d.db.SelectContext(ctx, &altPlayers, altQuery)
+	if err != nil {
+		return nil, err
+	}
+
+	// Combine and deduplicate
+	seen := make(map[string]bool)
+	var allPlayers []string
+	for _, name := range mainPlayers {
+		if !seen[name] {
+			seen[name] = true
+			allPlayers = append(allPlayers, name)
+		}
+	}
+	for _, name := range altPlayers {
+		if !seen[name] {
+			seen[name] = true
+			allPlayers = append(allPlayers, name)
+		}
+	}
+
+	return allPlayers, nil
 }
 
 // GetDiscordUserIDForPlayer returns the Discord user ID for a player name (checking both main and alts)

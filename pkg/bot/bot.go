@@ -53,3 +53,18 @@ func New(token string, opts ...Option) (*Bot, error) {
 
 	return b, nil
 }
+
+// SendMessage sends a message to a Discord channel
+func (b *Bot) SendMessage(channelID, message string) error {
+	_, err := b.session.ChannelMessageSend(channelID, message)
+	return err
+}
+
+// SendMessageWithEmbed sends a message with an embed to a Discord channel
+func (b *Bot) SendMessageWithEmbed(channelID, content string, embed *discordgo.MessageEmbed) error {
+	_, err := b.session.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+		Content: content,
+		Embeds:  []*discordgo.MessageEmbed{embed},
+	})
+	return err
+}

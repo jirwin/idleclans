@@ -6,29 +6,60 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/jirwin/idleclans/pkg/idleclans"
 	"github.com/jirwin/idleclans/pkg/quests"
 	"go.uber.org/zap"
 )
 
 // Config holds the web server configuration
 type Config struct {
-	PublicPort         int
-	AdminPort          int
-	BaseURL            string
-	DiscordClientID    string
+	PublicPort          int
+	AdminPort           int
+	BaseURL             string
+	DiscordClientID     string
 	DiscordClientSecret string
-	SessionSecret      string
+	SessionSecret       string
+	RequiredGuild       string // Guild name required for registration
+	DiscordChannelID    string // Channel to send messages to
+}
+
+// DiscordEmbed represents a Discord embed for the web server
+type DiscordEmbed struct {
+	Title       string
+	Description string
+	Color       int
+	Fields      []DiscordEmbedField
+}
+
+// DiscordEmbedField represents a field in a Discord embed
+type DiscordEmbedField struct {
+	Name   string
+	Value  string
+	Inline bool
+}
+
+// DiscordMessageSender interface for sending messages to Discord
+type DiscordMessageSender interface {
+	SendMessage(channelID, message string) error
+	SendMessageWithEmbed(channelID, content string, embed *DiscordEmbed) error
 }
 
 // Server represents the web server
 type Server struct {
-	config       *Config
-	db           *quests.DB
-	logger       *zap.Logger
-	publicServer *http.Server
-	adminServer  *http.Server
-	sessionStore *SessionStore
-	sseBroker    *SSEBroker
+	config        *Config
+	db            *quests.DB
+	logger        *zap.Logger
+	publicServer  *http.Server
+	adminServer   *http.Server
+	sessionStore  *SessionStore
+	sseBroker     *SSEBroker
+	icClient      *idleclans.Client
+	discordSender DiscordMessageSender
+}
+
+// SetDiscordSender sets the Discord message sender
+func (s *Server) SetDiscordSender(sender DiscordMessageSender) {
+	s.discordSender = sender
 }
 
 // NewServer creates a new web server
@@ -43,6 +74,7 @@ func NewServer(config *Config, db *quests.DB, logger *zap.Logger) (*Server, erro
 		logger:       logger,
 		sessionStore: NewSessionStore(config.SessionSecret, db),
 		sseBroker:    NewSSEBroker(logger),
+		icClient:     idleclans.New(),
 	}
 
 	return s, nil
@@ -121,11 +153,21 @@ func (s *Server) setupPublicRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/auth/login", s.handleLogin)
 	mux.HandleFunc("GET /api/auth/callback", s.handleCallback)
 	mux.HandleFunc("POST /api/auth/logout", s.handleLogout)
+	mux.HandleFunc("POST /api/auth/register", s.withAuth(s.handleRegister))
 
 	// Protected API routes
 	mux.HandleFunc("GET /api/me", s.withAuth(s.handleGetMe))
 	mux.HandleFunc("PUT /api/quests/{playerName}/{boss}", s.withAuth(s.handleUpdateQuest))
 	mux.HandleFunc("PUT /api/keys/{playerName}/{keyType}", s.withAuth(s.handleUpdateKeys))
+	mux.HandleFunc("POST /api/alts", s.withAuth(s.handleAddAlt))
+	mux.HandleFunc("DELETE /api/alts/{playerName}", s.withAuth(s.handleRemoveAlt))
+
+	// Clan view routes (authenticated)
+	mux.HandleFunc("GET /api/clan/bosses", s.withAuth(s.handleGetClanBosses))
+	mux.HandleFunc("GET /api/clan/keys", s.withAuth(s.handleGetClanKeys))
+	mux.HandleFunc("GET /api/clan/players", s.withAuth(s.handleGetClanPlayers))
+	mux.HandleFunc("POST /api/clan/plan", s.withAuth(s.handleGetClanPlan))
+	mux.HandleFunc("POST /api/clan/plan/send", s.withAuth(s.handleSendPlanToDiscord))
 
 	// SSE endpoint for live updates
 	mux.HandleFunc("GET /api/events", s.handleSSE)
@@ -141,6 +183,8 @@ func (s *Server) setupAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/players/{discordId}", s.handleAdminGetPlayer)
 	mux.HandleFunc("PUT /api/players/{discordId}/quests/{playerName}/{boss}", s.handleAdminUpdateQuest)
 	mux.HandleFunc("PUT /api/players/{discordId}/keys/{playerName}/{keyType}", s.handleAdminUpdateKeys)
+	mux.HandleFunc("POST /api/players/{discordId}/unregister", s.handleAdminUnregisterPlayer)
+	mux.HandleFunc("DELETE /api/players/{discordId}", s.handleAdminDeletePlayer)
 
 	// SSE endpoint for live updates
 	mux.HandleFunc("GET /api/events", s.handleAdminSSE)

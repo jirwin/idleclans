@@ -80,7 +80,7 @@ export function KeysCard({ playerName, keys, onUpdateKeys, isAdmin }: KeysCardPr
                       value={editValue}
                       onChange={(e) => setEditValue(e.target.value)}
                       onKeyDown={(e) => handleKeyDown(e, keyInfo.type)}
-                      onBlur={() => handleSave(keyInfo.type)}
+                      onFocus={(e) => e.target.select()}
                       className="w-20 px-3 py-2 text-base bg-[var(--color-bg-dark)] border border-violet-500 rounded-lg text-white text-center focus:outline-none focus:ring-2 focus:ring-violet-500"
                       min="0"
                       autoFocus

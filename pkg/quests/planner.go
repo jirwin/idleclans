@@ -46,6 +46,17 @@ type PlanResult struct {
 
 // GeneratePlan creates an efficient party schedule
 func (p *Planner) GeneratePlan(ctx context.Context, weekNumber, year int) (*PlanResult, error) {
+	return p.GeneratePlanFiltered(ctx, weekNumber, year, nil)
+}
+
+// GeneratePlanFiltered creates a plan filtered to specific players (nil = all players)
+func (p *Planner) GeneratePlanFiltered(ctx context.Context, weekNumber, year int, onlinePlayers []string) (*PlanResult, error) {
+	// Build a set of online players for quick lookup
+	onlineSet := make(map[string]bool)
+	filterByOnline := len(onlinePlayers) > 0
+	for _, name := range onlinePlayers {
+		onlineSet[name] = true
+	}
 	// 1. Fetch all quests for the week
 	questsList, err := p.db.GetAllQuestsForWeek(ctx, weekNumber, year)
 	if err != nil {
@@ -96,10 +107,16 @@ func (p *Planner) GeneratePlan(ctx context.Context, weekNumber, year int) (*Plan
 	}
 
 	// Separate players into those with needs and available helpers
+	// If filtering by online, only include online players
 	var playersWithNeeds []*PlayerProfile
 	var availableHelpers []*PlayerProfile
 
 	for _, prof := range profiles {
+		// Skip players not in the online filter
+		if filterByOnline && !onlineSet[prof.Name] {
+			continue
+		}
+		
 		if prof.TotalNeed > 0 {
 			playersWithNeeds = append(playersWithNeeds, prof)
 		} else {

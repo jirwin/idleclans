@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/bwmarrin/discordgo"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"github.com/jirwin/idleclans/pkg/bot"
 	"github.com/jirwin/idleclans/pkg/quests"
@@ -15,6 +16,34 @@ import (
 	icPlugin "github.com/jirwin/idleclans/plugins/idleclans"
 	"go.uber.org/zap"
 )
+
+// botAdapter adapts the Bot to the DiscordMessageSender interface
+type botAdapter struct {
+	bot *bot.Bot
+}
+
+func (a *botAdapter) SendMessage(channelID, message string) error {
+	return a.bot.SendMessage(channelID, message)
+}
+
+func (a *botAdapter) SendMessageWithEmbed(channelID, content string, embed *web.DiscordEmbed) error {
+	// Convert web.DiscordEmbed to discordgo.MessageEmbed
+	dgEmbed := &discordgo.MessageEmbed{
+		Title:       embed.Title,
+		Description: embed.Description,
+		Color:       embed.Color,
+	}
+	
+	for _, field := range embed.Fields {
+		dgEmbed.Fields = append(dgEmbed.Fields, &discordgo.MessageEmbedField{
+			Name:   field.Name,
+			Value:  field.Value,
+			Inline: field.Inline,
+		})
+	}
+	
+	return a.bot.SendMessageWithEmbed(channelID, content, dgEmbed)
+}
 
 func initLogging(ctx context.Context) context.Context {
 	l := zap.Must(zap.NewProduction())
@@ -103,6 +132,8 @@ func main() {
 			DiscordClientID:     discordClientID,
 			DiscordClientSecret: discordClientSecret,
 			SessionSecret:       getCredential("session_secret", "SESSION_SECRET"),
+			RequiredGuild:       os.Getenv("REQUIRED_GUILD"),
+			DiscordChannelID:    os.Getenv("DISCORD_CHANNEL_ID"),
 		}
 
 		if webConfig.BaseURL == "" {
@@ -123,6 +154,7 @@ func main() {
 		l.Info("Web server started",
 			zap.Int("public_port", webConfig.PublicPort),
 			zap.Int("admin_port", webConfig.AdminPort),
+			zap.String("required_guild", webConfig.RequiredGuild),
 		)
 	} else {
 		l.Info("Web server disabled (DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET not set)")
@@ -155,6 +187,12 @@ func main() {
 	if err != nil {
 		l.Error("Error starting bot,", zap.Error(err))
 		os.Exit(1)
+	}
+
+	// Connect Discord sender to web server after bot starts
+	if webServer != nil {
+		webServer.SetDiscordSender(&botAdapter{bot: b})
+		l.Info("Connected Discord message sender to web server")
 	}
 
 	l.Info("Bot is now running. Press CTRL+C to exit.")

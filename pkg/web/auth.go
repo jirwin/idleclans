@@ -335,3 +335,142 @@ func (s *Server) getDiscordUser(accessToken string) (*DiscordUser, error) {
 	return &user, nil
 }
 
+// RegisterRequest represents a request to register a character
+type RegisterRequest struct {
+	PlayerName string `json:"player_name"`
+}
+
+// RegisterResponse represents the response from registration
+type RegisterResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+// handleRegister handles character registration for new users
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	session := getSession(r)
+	if session == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	ctx := r.Context()
+
+	// Check if user already has a character registered
+	existingPlayer, err := s.db.GetPlayerName(ctx, session.UserID)
+	if err == nil && existingPlayer != "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(RegisterResponse{
+			Success: false,
+			Error:   "You already have a character registered: " + existingPlayer,
+		})
+		return
+	}
+
+	// Parse request
+	var req RegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(RegisterResponse{
+			Success: false,
+			Error:   "Invalid request body",
+		})
+		return
+	}
+
+	if req.PlayerName == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(RegisterResponse{
+			Success: false,
+			Error:   "Player name is required",
+		})
+		return
+	}
+
+	// Fetch player from IdleClans API
+	s.logger.Info("Looking up player in IdleClans API",
+		zap.String("player_name", req.PlayerName))
+	
+	player, err := s.icClient.GetPlayer(ctx, req.PlayerName)
+	if err != nil {
+		s.logger.Warn("Failed to fetch player from IdleClans API",
+			zap.String("player_name", req.PlayerName),
+			zap.Error(err))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(RegisterResponse{
+			Success: false,
+			Error:   "Could not find player '" + req.PlayerName + "' in IdleClans. Please check the spelling.",
+		})
+		return
+	}
+
+	// Check if player data is valid (API might return empty player for non-existent names)
+	if player == nil || player.Username == "" {
+		s.logger.Warn("IdleClans API returned empty player",
+			zap.String("player_name", req.PlayerName))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(RegisterResponse{
+			Success: false,
+			Error:   "Could not find player '" + req.PlayerName + "' in IdleClans. Please check the spelling.",
+		})
+		return
+	}
+
+	s.logger.Info("Found player in IdleClans API",
+		zap.String("player_name", player.Username),
+		zap.String("player_guild", player.GuildName),
+		zap.String("required_guild", s.config.RequiredGuild))
+
+	// Check guild requirement if configured
+	if s.config.RequiredGuild != "" {
+		if !strings.EqualFold(player.GuildName, s.config.RequiredGuild) {
+			s.logger.Warn("Player guild does not match required guild",
+				zap.String("player_name", req.PlayerName),
+				zap.String("player_guild", player.GuildName),
+				zap.String("required_guild", s.config.RequiredGuild))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(RegisterResponse{
+				Success: false,
+				Error:   fmt.Sprintf("This app is only for members of '%s'. Your character '%s' is in guild '%s'.",
+					s.config.RequiredGuild, player.Username, player.GuildName),
+			})
+			return
+		}
+	}
+
+	// Register the player
+	err = s.db.RegisterPlayer(ctx, session.UserID, player.Username)
+	if err != nil {
+		s.logger.Error("Failed to register player",
+			zap.String("discord_id", session.UserID),
+			zap.String("player_name", player.Username),
+			zap.Error(err))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(RegisterResponse{
+			Success: false,
+			Error:   "Failed to register character. Please try again.",
+		})
+		return
+	}
+
+	s.logger.Info("Player registered successfully",
+		zap.String("discord_id", session.UserID),
+		zap.String("discord_username", session.Username),
+		zap.String("player_name", player.Username),
+		zap.String("guild", player.GuildName))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(RegisterResponse{
+		Success: true,
+		Message: fmt.Sprintf("Successfully registered character '%s'!", player.Username),
+	})
+}
+
