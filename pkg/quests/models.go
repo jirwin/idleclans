@@ -106,3 +106,51 @@ func ResolveBossName(input string) (string, bool) {
 
 	return "", false
 }
+
+// ResolveKeyType attempts to resolve a key type from various input formats:
+// 1. Full key type (e.g., "mountain")
+// 2. Full color name (e.g., "brown")
+// 3. Boss name/alias (e.g., "griffin" -> "mountain")
+// 4. Prefix match on key type (e.g., "m" -> "mountain")
+// 5. Prefix match on color name (e.g., "br" -> "brown" -> "mountain")
+func ResolveKeyType(input string) (string, bool) {
+	input = strings.ToLower(strings.TrimSpace(input))
+
+	// 1. Check if it's a valid key type directly
+	for _, key := range BossToKey {
+		if key == input {
+			return key, true
+		}
+	}
+
+	// 2. Check if it's a valid color name
+	if key, ok := ColorToKey[input]; ok {
+		return key, true
+	}
+
+	// 3. Check if it resolves to a boss name
+	if bossName, ok := ResolveBossName(input); ok {
+		if key, ok := GetKeyForBoss(bossName); ok {
+			return key, true
+		}
+	}
+
+	// 4. Prefix match on key type
+	for _, key := range BossToKey {
+		if strings.HasPrefix(key, input) {
+			return key, true
+		}
+	}
+
+	// 5. Prefix match on color name
+	for color, key := range ColorToKey {
+		// ColorToKey keys are already lowercased in init()
+		// But wait, ColorToKey keys are colors, values are key types
+		// The map is color -> key
+		if strings.HasPrefix(color, input) {
+			return key, true
+		}
+	}
+
+	return "", false
+}

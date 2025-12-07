@@ -94,6 +94,8 @@ func (p *plugin) questsCmd(ctx context.Context) bot.MessageHandler {
 			p.questsHandler.handleHelp(ctx, s, m)
 		case "register":
 			p.questsHandler.handleRegister(ctx, s, m, parts[1:])
+		case "bosses":
+			p.questsHandler.handleBosses(ctx, s, m, parts[1:])
 		case "keys":
 			p.questsHandler.handleKeys(ctx, s, m, parts[1:])
 		case "clan":
@@ -102,8 +104,10 @@ func (p *plugin) questsCmd(ctx context.Context) bot.MessageHandler {
 			p.questsHandler.handlePing(ctx, s, m)
 		case "complete":
 			p.questsHandler.handleComplete(ctx, s, m, parts[1:])
-		case "who":
-			p.questsHandler.handleWho(ctx, s, m, parts[1:])
+		case "plan":
+			p.questsHandler.handlePlan(ctx, s, m, parts[1:])
+		case "alt", "alts":
+			p.questsHandler.handleAlt(ctx, s, m, parts[1:])
 		default:
 			// Additional input provided but not a known command - assume it's a quest update command
 			p.questsHandler.handleUpdate(ctx, s, m, parts)
@@ -163,13 +167,23 @@ func (h *questsHandler) handleHelp(ctx context.Context, s *discordgo.Session, m 
 				Inline: false,
 			},
 			{
+				Name:   "Manage Alts",
+				Value:  "`!quests alt` - List your registered players\n`!quests alt add <name>` - Add an alt\n`!quests alt remove <name>` - Remove an alt\nYou'll be pinged for quests on your main and all alts.",
+				Inline: false,
+			},
+			{
 				Name:   "Update Quests",
 				Value:  "`!quests [player_name] <boss> <count> [boss] <count> ...`\nUpdate your weekly quests. Supports comma or space separated.\nBoss names can be full name, first letter, or key color.\nExample: `!quests griffin 45 hades 12` or `!quests g 45 h 12`",
 				Inline: false,
 			},
 			{
-				Name:   "View Keys",
-				Value:  "`!quests keys [player_name] [week|date]` - View key requirements for a player\nExample: `!quests keys` or `!quests keys mekkyra 2025-01-15`",
+				Name:   "Bosses",
+				Value:  "`!quests bosses` - Show who has which bosses (global)\n`!quests bosses <player>` - View bosses for a player\n`!quests bosses <player> <boss> <count> ...` - Set bosses for a player\nExample: `!quests bosses MyAlt griffin 10 medusa 5`",
+				Inline: false,
+			},
+			{
+				Name:   "Keys",
+				Value:  "`!quests keys` - Show who has which keys (global)\n`!quests keys <player>` - View keys for a player\n`!quests keys <player> <key> <count> ...` - Set keys for a player\nExample: `!quests keys MyAlt mountain 50 stone 30`",
 				Inline: false,
 			},
 			{
@@ -179,17 +193,17 @@ func (h *questsHandler) handleHelp(ctx context.Context, s *discordgo.Session, m 
 			},
 			{
 				Name:   "Complete Quest",
-				Value:  "`!quests complete <boss> [amount]` - Mark a quest as complete or reduce by amount\nExample: `!quests complete griffin` or `!quests complete g 30`",
+				Value:  "`!quests complete <boss> [kills] [keys_remaining]` - Mark kills as complete and optionally update key count\nExample: `!quests complete griffin 10` (just kills) or `!quests complete g 10 5` (10 kills, 5 mountain keys left)",
+				Inline: false,
+			},
+			{
+				Name:   "Party Planner",
+				Value:  "`!quests plan [week|date]` - Generate an optimized party plan for boss quests\nExample: `!quests plan`",
 				Inline: false,
 			},
 			{
 				Name:   "Ping Matching Players",
 				Value:  "`!quests ping` - Ping players who have matching quests with you",
-				Inline: false,
-			},
-			{
-				Name:   "Who Has Keys",
-				Value:  "`!quests who [week|date]` - Show each boss and who has how many keys\nExample: `!quests who` or `!quests who 5`",
 				Inline: false,
 			},
 			{
@@ -220,6 +234,90 @@ func (h *questsHandler) handleRegister(ctx context.Context, s *discordgo.Session
 	}
 
 	s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Registered default player name: **%s**", playerName))
+}
+
+func (h *questsHandler) handleAlt(ctx context.Context, s *discordgo.Session, m *discordgo.MessageCreate, args []string) {
+	l := ctxzap.Extract(ctx)
+
+	if len(args) == 0 {
+		// Show current alts
+		alts, err := h.db.GetAlts(ctx, m.Author.ID)
+		if err != nil {
+			l.Error("Failed to get alts", zap.Error(err))
+			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Error getting alts: %s", err.Error()))
+			return
+		}
+
+		mainName, _ := h.db.GetPlayerName(ctx, m.Author.ID)
+
+		var fields []*discordgo.MessageEmbedField
+		if mainName != "" {
+			fields = append(fields, &discordgo.MessageEmbedField{
+				Name:   "Main",
+				Value:  mainName,
+				Inline: false,
+			})
+		}
+
+		if len(alts) > 0 {
+			fields = append(fields, &discordgo.MessageEmbedField{
+				Name:   "Alts",
+				Value:  strings.Join(alts, "\n"),
+				Inline: false,
+			})
+		}
+
+		if len(fields) == 0 {
+			s.ChannelMessageSend(m.ChannelID, "No players registered. Use `!quests register <player_name>` to register your main player.")
+			return
+		}
+
+		embed := &discordgo.MessageEmbed{
+			Title:  "Your Registered Players",
+			Color:  0x9b59b6,
+			Fields: fields,
+		}
+		s.ChannelMessageSendEmbeds(m.ChannelID, []*discordgo.MessageEmbed{embed})
+		return
+	}
+
+	subCommand := strings.ToLower(args[0])
+	switch subCommand {
+	case "add":
+		if len(args) < 2 {
+			s.ChannelMessageSend(m.ChannelID, "Usage: `!quests alt add <player_name>`")
+			return
+		}
+		playerName := strings.Join(args[1:], " ")
+		err := h.db.RegisterAlt(ctx, m.Author.ID, playerName)
+		if err != nil {
+			l.Error("Failed to register alt", zap.Error(err))
+			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Error registering alt: %s", err.Error()))
+			return
+		}
+		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Added alt: **%s**", playerName))
+
+	case "remove", "rm", "delete":
+		if len(args) < 2 {
+			s.ChannelMessageSend(m.ChannelID, "Usage: `!quests alt remove <player_name>`")
+			return
+		}
+		playerName := strings.Join(args[1:], " ")
+		err := h.db.RemoveAlt(ctx, m.Author.ID, playerName)
+		if err != nil {
+			l.Error("Failed to remove alt", zap.Error(err))
+			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Error removing alt: %s", err.Error()))
+			return
+		}
+		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Removed alt: **%s**", playerName))
+
+	case "list":
+		// Same as no args - show all
+		h.handleAlt(ctx, s, m, []string{})
+
+	default:
+		s.ChannelMessageSend(m.ChannelID, "Usage: `!quests alt [add|remove|list] <player_name>`\nExample: `!quests alt add MyAltName`")
+	}
 }
 
 func (h *questsHandler) handleUpdate(ctx context.Context, s *discordgo.Session, m *discordgo.MessageCreate, args []string) {
@@ -332,11 +430,163 @@ func (h *questsHandler) handleUpdate(ctx context.Context, s *discordgo.Session, 
 	}
 }
 
+func (h *questsHandler) handleKeys(ctx context.Context, s *discordgo.Session, m *discordgo.MessageCreate, args []string) {
+	l := ctxzap.Extract(ctx)
+
+	// 1. Global View (No arguments)
+	if len(args) == 0 {
+		allKeys, err := h.db.GetAllPlayerKeys(ctx)
+		if err != nil {
+			l.Error("Failed to get all player keys", zap.Error(err))
+			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Error getting keys: %s", err.Error()))
+			return
+		}
+
+		if len(allKeys) == 0 {
+			s.ChannelMessageSend(m.ChannelID, "No keys tracked for any player")
+			return
+		}
+
+		// Group by KeyType
+		keyGroups := make(map[string][]quests.PlayerKeyEntry)
+		for _, k := range allKeys {
+			keyGroups[k.KeyType] = append(keyGroups[k.KeyType], k)
+		}
+
+		// Sort keys alphabetically
+		var keyTypes []string
+		for k := range keyGroups {
+			keyTypes = append(keyTypes, k)
+		}
+		sort.Strings(keyTypes)
+
+		var fields []*discordgo.MessageEmbedField
+		for _, k := range keyTypes {
+			entries := keyGroups[k]
+			// Sort by count desc, then player asc
+			sort.Slice(entries, func(i, j int) bool {
+				if entries[i].Count != entries[j].Count {
+					return entries[i].Count > entries[j].Count
+				}
+				return entries[i].PlayerName < entries[j].PlayerName
+			})
+
+			var sb strings.Builder
+			for _, e := range entries {
+				sb.WriteString(fmt.Sprintf("%s: %d\n", e.PlayerName, e.Count))
+			}
+
+			fields = append(fields, &discordgo.MessageEmbedField{
+				Name:   formatKeyTypeWithEmoji(k),
+				Value:  sb.String(),
+				Inline: true,
+			})
+		}
+
+		embed := &discordgo.MessageEmbed{
+			Title:       "Who Has Keys",
+			Description: fmt.Sprintf("Updated: %s", time.Now().Format("2006-01-02")),
+			Color:       0xf1c40f, // Yellow color
+			Fields:      fields,
+		}
+		s.ChannelMessageSendEmbeds(m.ChannelID, []*discordgo.MessageEmbed{embed})
+		return
+	}
+
+	// Check if first arg is a player name
+	playerName := args[0]
+
+	// 2. Check if it's an update command: keys <player> <key> <count> [key count ...]
+	if len(args) >= 3 {
+		// Check if second arg is a key type and third is a number
+		if _, ok := quests.ResolveKeyType(args[1]); ok {
+			if _, err := strconv.Atoi(args[2]); err == nil {
+				// This is an update command
+				h.updatePlayerKeys(ctx, s, m, playerName, args[1:])
+				return
+			}
+		}
+	}
+
+	// 3. Player View (Single player name)
+	targetPlayer := strings.Join(args, " ")
+	keysMap, err := h.db.GetPlayerKeysByName(ctx, targetPlayer)
+	if err != nil {
+		l.Error("Failed to get player keys by name", zap.Error(err))
+		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Error getting keys for %s: %s", targetPlayer, err.Error()))
+		return
+	}
+
+	if len(keysMap) == 0 {
+		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("No keys tracked for **%s**", targetPlayer))
+		return
+	}
+
+	// Sort keys alphabetically
+	var keyTypes []string
+	for k := range keysMap {
+		keyTypes = append(keyTypes, k)
+	}
+	sort.Strings(keyTypes)
+
+	var sb strings.Builder
+	for _, k := range keyTypes {
+		sb.WriteString(fmt.Sprintf("**%s**: %d\n", formatKeyTypeWithEmoji(k), keysMap[k]))
+	}
+
+	embed := &discordgo.MessageEmbed{
+		Title:       fmt.Sprintf("Key Inventory: %s", targetPlayer),
+		Description: sb.String(),
+		Color:       0xf1c40f, // Yellow color
+	}
+	s.ChannelMessageSendEmbeds(m.ChannelID, []*discordgo.MessageEmbed{embed})
+}
+
+// updatePlayerKeys updates key counts for a player
+func (h *questsHandler) updatePlayerKeys(ctx context.Context, s *discordgo.Session, m *discordgo.MessageCreate, playerName string, keyArgs []string) {
+	l := ctxzap.Extract(ctx)
+
+	if len(keyArgs) == 0 || len(keyArgs)%2 != 0 {
+		s.ChannelMessageSend(m.ChannelID, "Invalid format. Expected: `!quests keys <player> <key> <count> [key count ...]`")
+		return
+	}
+
+	updates := 0
+	for i := 0; i < len(keyArgs); i += 2 {
+		inputKey := strings.TrimSpace(keyArgs[i])
+		countStr := strings.TrimSpace(keyArgs[i+1])
+
+		keyType, ok := quests.ResolveKeyType(inputKey)
+		if !ok {
+			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Invalid key/boss/color: %s", inputKey))
+			continue
+		}
+
+		count, err := strconv.Atoi(countStr)
+		if err != nil || count < 0 {
+			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Invalid count for %s: %s (must be non-negative)", inputKey, countStr))
+			continue
+		}
+
+		err = h.db.UpsertPlayerKeys(ctx, m.Author.ID, keyType, count)
+		if err != nil {
+			l.Error("Failed to update player keys", zap.Error(err))
+			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Error updating %s: %s", keyType, err.Error()))
+			continue
+		}
+		updates++
+	}
+
+	if updates > 0 {
+		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Updated %d key count(s) for **%s**", updates, playerName))
+	}
+}
+
 func (h *questsHandler) handleComplete(ctx context.Context, s *discordgo.Session, m *discordgo.MessageCreate, args []string) {
 	l := ctxzap.Extract(ctx)
 
 	if len(args) == 0 {
-		s.ChannelMessageSend(m.ChannelID, "Usage: `!quests complete <boss> [amount]` - Marks a quest as complete (sets to 0) or reduces by amount")
+		s.ChannelMessageSend(m.ChannelID, "Usage: `!quests complete <boss> [kills] [keys_remaining]` - Marks kills as complete and optionally updates key count")
 		return
 	}
 
@@ -380,32 +630,46 @@ func (h *questsHandler) handleComplete(ctx context.Context, s *discordgo.Session
 		return
 	}
 
-	// Determine new required_kills value
+	// Determine new required_kills value and optional keys update
 	var newRequiredKills int
-	var amount int
+	var killsCompleted int
+	var keysRemaining *int // Use pointer to know if it was provided
+
 	if len(args) > 1 {
 		// Amount provided - reduce by that amount
 		amountStr := strings.TrimSpace(args[1])
 		var err error
-		amount, err = strconv.Atoi(amountStr)
-		if err != nil || amount < 0 {
-			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Invalid amount: %s (must be a non-negative integer)", amountStr))
+		killsCompleted, err = strconv.Atoi(amountStr)
+		if err != nil || killsCompleted < 0 {
+			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Invalid kills amount: %s (must be a non-negative integer)", amountStr))
 			return
 		}
-		newRequiredKills = currentRequiredKills - amount
+		newRequiredKills = currentRequiredKills - killsCompleted
 		if newRequiredKills < 0 {
 			newRequiredKills = 0
 		}
+
+		// Check for optional keys remaining argument
+		if len(args) > 2 {
+			keysStr := strings.TrimSpace(args[2])
+			keysVal, err := strconv.Atoi(keysStr)
+			if err != nil || keysVal < 0 {
+				s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Invalid keys remaining: %s (must be a non-negative integer)", keysStr))
+				return
+			}
+			keysRemaining = &keysVal
+		}
+
 		l.Info("Completing quest with amount",
 			zap.String("player", playerName),
 			zap.String("boss", bossName),
 			zap.Int("current", currentRequiredKills),
-			zap.Int("amount", amount),
+			zap.Int("kills", killsCompleted),
 			zap.Int("new", newRequiredKills))
 	} else {
 		// No amount provided - set to 0 (complete)
 		newRequiredKills = 0
-		amount = currentRequiredKills
+		killsCompleted = currentRequiredKills
 		l.Info("Completing quest (full)",
 			zap.String("player", playerName),
 			zap.String("boss", bossName),
@@ -421,54 +685,145 @@ func (h *questsHandler) handleComplete(ctx context.Context, s *discordgo.Session
 		return
 	}
 
+	msg := fmt.Sprintf("Reduced %s (%s) by %d for **%s** (now %d remaining)", formatBossNameWithEmoji(bossName), bossInput, killsCompleted, playerName, newRequiredKills)
 	if newRequiredKills == 0 {
-		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Marked %s (%s) as complete for **%s**", formatBossNameWithEmoji(bossName), bossInput, playerName))
-	} else {
-		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Reduced %s (%s) by %d for **%s** (now %d remaining)", formatBossNameWithEmoji(bossName), bossInput, amount, playerName, newRequiredKills))
+		msg = fmt.Sprintf("Marked %s (%s) as complete for **%s**", formatBossNameWithEmoji(bossName), bossInput, playerName)
 	}
+
+	// If keys remaining was provided, update key count
+	if keysRemaining != nil {
+		keyType, ok := quests.GetKeyForBoss(bossName)
+		if ok {
+			err = h.db.UpsertPlayerKeys(ctx, m.Author.ID, keyType, *keysRemaining)
+			if err != nil {
+				l.Error("Failed to update player keys", zap.Error(err))
+				msg += fmt.Sprintf("\n(Warning: Failed to update keys: %s)", err.Error())
+			} else {
+				msg += fmt.Sprintf("\nUpdated **%s** keys to %d", cases.Title(language.English).String(keyType), *keysRemaining)
+			}
+		} else {
+			msg += "\n(Warning: Could not determine key type for this boss)"
+		}
+	}
+
+	s.ChannelMessageSend(m.ChannelID, msg)
 }
 
-func (h *questsHandler) handleKeys(ctx context.Context, s *discordgo.Session, m *discordgo.MessageCreate, args []string) {
-	l := ctxzap.Extract(ctx)
+func (h *questsHandler) handleBosses(ctx context.Context, s *discordgo.Session, m *discordgo.MessageCreate, args []string) {
+	weekNumber, year := getCurrentWeek()
 
-	var playerName string
-	var weekNumber, year int
-	var err error
-
-	// Parse arguments
+	// 1. Global View (No arguments) - show who has which bosses
 	if len(args) == 0 {
-		// Use default player and current week
-		playerName, err = h.db.GetPlayerName(ctx, m.Author.ID)
-		if err != nil {
-			s.ChannelMessageSend(m.ChannelID, "No default player name registered. Use `!quests register <player_name>` first, or provide player name: `!quests keys <player_name> [week|date]`")
-			return
-		}
-		weekNumber, year = getCurrentWeek()
-	} else {
-		// Check if first arg is a week/date or player name
-		weekNum, yr, parseErr := parseWeekOrDate(args[0])
-		if parseErr == nil {
-			// First arg is week/date, use default player
-			playerName, err = h.db.GetPlayerName(ctx, m.Author.ID)
-			if err != nil {
-				s.ChannelMessageSend(m.ChannelID, "No default player name registered. Use `!quests register <player_name>` first")
+		h.showGlobalBosses(ctx, s, m, weekNumber, year)
+		return
+	}
+
+	// Check if first arg is a player name
+	playerName := args[0]
+
+	// 2. Check if it's an update command (args[1:] are boss/count pairs)
+	if len(args) >= 3 {
+		// Check if second arg is a boss name (update mode)
+		if _, ok := quests.ResolveBossName(args[1]); ok {
+			// Check if third arg is a number
+			if _, err := strconv.Atoi(args[2]); err == nil {
+				// This is an update command: bosses <player> <boss> <count> [...]
+				h.updatePlayerBosses(ctx, s, m, playerName, args[1:])
 				return
-			}
-			weekNumber, year = weekNum, yr
-		} else {
-			// First arg is player name
-			playerName = args[0]
-			if len(args) > 1 {
-				weekNumber, year, err = parseWeekOrDate(args[1])
-				if err != nil {
-					s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Invalid week/date format: %s. Use ISO week number (1-53) or date (YYYY-MM-DD)", args[1]))
-					return
-				}
-			} else {
-				weekNumber, year = getCurrentWeek()
 			}
 		}
 	}
+
+	// 3. Player View - show which bosses that player needs
+	h.showPlayerBosses(ctx, s, m, playerName, weekNumber, year)
+}
+
+// showGlobalBosses shows which players have quests for each boss (formerly handleWho)
+func (h *questsHandler) showGlobalBosses(ctx context.Context, s *discordgo.Session, m *discordgo.MessageCreate, weekNumber, year int) {
+	l := ctxzap.Extract(ctx)
+
+	questsList, err := h.db.GetAllQuestsForWeek(ctx, weekNumber, year)
+	if err != nil {
+		l.Error("Failed to get quests", zap.Error(err))
+		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Error getting quests: %s", err.Error()))
+		return
+	}
+
+	if len(questsList) == 0 {
+		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("No quests found for week %d of %d", weekNumber, year))
+		return
+	}
+
+	// Group by boss, then by player
+	type PlayerKeyInfo struct {
+		PlayerName string
+		KeyCount   int
+	}
+
+	bossPlayers := make(map[string][]PlayerKeyInfo)
+
+	for _, quest := range questsList {
+		remainingKills := quest.RequiredKills - quest.CurrentKills
+		if remainingKills <= 0 {
+			continue
+		}
+
+		bossPlayers[quest.BossName] = append(bossPlayers[quest.BossName], PlayerKeyInfo{
+			PlayerName: quest.PlayerName,
+			KeyCount:   remainingKills,
+		})
+	}
+
+	if len(bossPlayers) == 0 {
+		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("No boss requirements for week %d of %d (all quests completed)", weekNumber, year))
+		return
+	}
+
+	// Sort bosses alphabetically
+	bossNames := make([]string, 0, len(bossPlayers))
+	for bossName := range bossPlayers {
+		bossNames = append(bossNames, bossName)
+	}
+	sort.Strings(bossNames)
+
+	// Build embed fields - one field per boss
+	fields := make([]*discordgo.MessageEmbedField, 0, len(bossNames))
+	for _, bossName := range bossNames {
+		players := bossPlayers[bossName]
+
+		// Sort players by key count (descending), then by name
+		sort.Slice(players, func(i, j int) bool {
+			if players[i].KeyCount != players[j].KeyCount {
+				return players[i].KeyCount > players[j].KeyCount
+			}
+			return players[i].PlayerName < players[j].PlayerName
+		})
+
+		var value strings.Builder
+		for _, player := range players {
+			value.WriteString(fmt.Sprintf("%s: %d\n", player.PlayerName, player.KeyCount))
+		}
+
+		fields = append(fields, &discordgo.MessageEmbedField{
+			Name:   formatBossNameWithEmoji(bossName),
+			Value:  value.String(),
+			Inline: true,
+		})
+	}
+
+	embed := &discordgo.MessageEmbed{
+		Title:       "Who Has Bosses",
+		Description: fmt.Sprintf("Week %d, %d", weekNumber, year),
+		Color:       0x9b59b6, // Purple color
+		Fields:      fields,
+	}
+
+	s.ChannelMessageSendEmbeds(m.ChannelID, []*discordgo.MessageEmbed{embed})
+}
+
+// showPlayerBosses shows which bosses a specific player needs
+func (h *questsHandler) showPlayerBosses(ctx context.Context, s *discordgo.Session, m *discordgo.MessageCreate, playerName string, weekNumber, year int) {
+	l := ctxzap.Extract(ctx)
 
 	questsList, err := h.db.GetPlayerQuests(ctx, playerName, weekNumber, year)
 	if err != nil {
@@ -482,7 +837,7 @@ func (h *questsHandler) handleKeys(ctx context.Context, s *discordgo.Session, m 
 		return
 	}
 
-	// Filter quests with remaining kills and calculate key requirements
+	// Filter quests with remaining kills
 	type BossKeyReq struct {
 		BossName      string
 		KeyType       string
@@ -491,8 +846,6 @@ func (h *questsHandler) handleKeys(ctx context.Context, s *discordgo.Session, m 
 	}
 
 	var bossReqs []BossKeyReq
-	totalReal := 0
-	totalEstimated := 0
 
 	for _, quest := range questsList {
 		keyType, ok := quests.GetKeyForBoss(quest.BossName)
@@ -514,12 +867,10 @@ func (h *questsHandler) handleKeys(ctx context.Context, s *discordgo.Session, m 
 			RealKeys:      realKeys,
 			EstimatedKeys: estimatedKeys,
 		})
-		totalReal += realKeys
-		totalEstimated += estimatedKeys
 	}
 
 	if len(bossReqs) == 0 {
-		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("No key requirements for **%s** in week %d of %d (all quests completed)", playerName, weekNumber, year))
+		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("No boss requirements for **%s** in week %d of %d (all quests completed)", playerName, weekNumber, year))
 		return
 	}
 
@@ -528,40 +879,66 @@ func (h *questsHandler) handleKeys(ctx context.Context, s *discordgo.Session, m 
 		return bossReqs[i].BossName < bossReqs[j].BossName
 	})
 
-	// Build embed fields - group by key type for better organization
-	keyGroups := make(map[string][]BossKeyReq)
+	// Build embed fields
+	fields := make([]*discordgo.MessageEmbedField, 0, len(bossReqs))
 	for _, req := range bossReqs {
-		keyGroups[req.KeyType] = append(keyGroups[req.KeyType], req)
-	}
-
-	// Sort key types for consistent output
-	keyTypes := make([]string, 0, len(keyGroups))
-	for keyType := range keyGroups {
-		keyTypes = append(keyTypes, keyType)
-	}
-	sort.Strings(keyTypes)
-
-	fields := make([]*discordgo.MessageEmbedField, 0, len(keyTypes))
-	for _, keyType := range keyTypes {
-		var value strings.Builder
-		for _, req := range keyGroups[keyType] {
-			value.WriteString(fmt.Sprintf("%d (%d)\n", req.RealKeys, req.EstimatedKeys))
-		}
 		fields = append(fields, &discordgo.MessageEmbedField{
-			Name:   formatBossNameWithEmoji(keyGroups[keyType][0].BossName),
-			Value:  value.String(),
+			Name:   formatBossNameWithEmoji(req.BossName),
+			Value:  fmt.Sprintf("%d (%d est.)", req.RealKeys, req.EstimatedKeys),
 			Inline: true,
 		})
 	}
 
 	embed := &discordgo.MessageEmbed{
-		Title:       fmt.Sprintf("Key Requirements for %s", playerName),
+		Title:       fmt.Sprintf("Boss Requirements for %s", playerName),
 		Description: fmt.Sprintf("Week %d, %d", weekNumber, year),
 		Color:       0x3498db, // Blue color
 		Fields:      fields,
 	}
 
 	s.ChannelMessageSendEmbeds(m.ChannelID, []*discordgo.MessageEmbed{embed})
+}
+
+// updatePlayerBosses updates boss quests for a player
+func (h *questsHandler) updatePlayerBosses(ctx context.Context, s *discordgo.Session, m *discordgo.MessageCreate, playerName string, bossArgs []string) {
+	l := ctxzap.Extract(ctx)
+
+	if len(bossArgs) == 0 || len(bossArgs)%2 != 0 {
+		s.ChannelMessageSend(m.ChannelID, "Invalid format. Expected: `!quests bosses <player> <boss> <count> [boss count ...]`")
+		return
+	}
+
+	weekNumber, year := getCurrentWeek()
+	updates := 0
+
+	for i := 0; i < len(bossArgs); i += 2 {
+		bossInput := strings.TrimSpace(bossArgs[i])
+		bossName, ok := quests.ResolveBossName(bossInput)
+		if !ok {
+			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Invalid boss name: %s. Valid bosses: %s", bossInput, strings.Join(quests.ValidBosses(), ", ")))
+			continue
+		}
+
+		countStr := strings.TrimSpace(bossArgs[i+1])
+		count, err := strconv.Atoi(countStr)
+		if err != nil || count < 0 {
+			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Invalid count: %s (must be a non-negative integer)", countStr))
+			continue
+		}
+
+		err = h.db.UpsertQuest(ctx, m.Author.ID, playerName, weekNumber, year, bossName, count)
+		if err != nil {
+			l.Error("Failed to upsert quest", zap.Error(err))
+			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Error updating quest for %s: %s", formatBossNameWithEmoji(bossName), err.Error()))
+			continue
+		}
+
+		updates++
+	}
+
+	if updates > 0 {
+		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Updated %d quest(s) for **%s**", updates, playerName))
+	}
 }
 
 func (h *questsHandler) handleClan(ctx context.Context, s *discordgo.Session, m *discordgo.MessageCreate, args []string) {
@@ -809,6 +1186,120 @@ func (h *questsHandler) handlePing(ctx context.Context, s *discordgo.Session, m 
 	s.ChannelMessageSendEmbeds(m.ChannelID, []*discordgo.MessageEmbed{embed})
 }
 
+func (h *questsHandler) handlePlan(ctx context.Context, s *discordgo.Session, m *discordgo.MessageCreate, args []string) {
+	l := ctxzap.Extract(ctx)
+
+	var weekNumber, year int
+	var err error
+
+	if len(args) > 0 {
+		weekNumber, year, err = parseWeekOrDate(args[0])
+		if err != nil {
+			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Invalid week/date format: %s. Use ISO week number (1-53) or date (YYYY-MM-DD)", args[0]))
+			return
+		}
+	} else {
+		weekNumber, year = getCurrentWeek()
+	}
+
+	planner := quests.NewPlanner(h.db)
+	plan, err := planner.GeneratePlan(ctx, weekNumber, year)
+	if err != nil {
+		l.Error("Failed to generate plan", zap.Error(err))
+		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Error generating plan: %s", err.Error()))
+		return
+	}
+
+	if len(plan.Parties) == 0 && len(plan.Leftovers) == 0 {
+		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("No quests found for week %d of %d", weekNumber, year))
+		return
+	}
+
+	// Build embeds
+	var embeds []*discordgo.MessageEmbed
+
+	// We might need multiple embeds if the plan is long
+	// For now, let's try to fit in one, or split fields
+
+	fields := []*discordgo.MessageEmbedField{}
+
+	for i, party := range plan.Parties {
+		var value strings.Builder
+		for _, task := range party.Tasks {
+			if task.NoKeys {
+				value.WriteString(fmt.Sprintf("**%s**: %d (⚠️ No keys)\n",
+					formatBossNameWithEmoji(task.BossName),
+					task.Kills))
+			} else {
+				value.WriteString(fmt.Sprintf("**%s**: %d (Key: %s)\n",
+					formatBossNameWithEmoji(task.BossName),
+					task.Kills,
+					task.KeyHolder))
+			}
+		}
+
+		playersList := strings.Join(party.Players, ", ")
+		fields = append(fields, &discordgo.MessageEmbedField{
+			Name:   fmt.Sprintf("Group %d: %s", i+1, playersList),
+			Value:  value.String(),
+			Inline: false,
+		})
+	}
+
+	if len(plan.Leftovers) > 0 {
+		var value strings.Builder
+		count := 0
+		for _, p := range plan.Leftovers {
+			var needs []string
+			for boss, n := range p.Needs {
+				if n > 0 {
+					needs = append(needs, fmt.Sprintf("%s (%d)", formatBossNameWithEmoji(boss), n))
+				}
+			}
+			if len(needs) > 0 {
+				value.WriteString(fmt.Sprintf("**%s**: %s\n", p.Name, strings.Join(needs, ", ")))
+				count++
+			}
+			if count >= 10 { // Limit leftovers display
+				value.WriteString("...and more")
+				break
+			}
+		}
+
+		if value.Len() > 0 {
+			fields = append(fields, &discordgo.MessageEmbedField{
+				Name:   "Unmatched / Leftovers",
+				Value:  value.String(),
+				Inline: false,
+			})
+		}
+	}
+
+	// Discord limit is 25 fields per embed. If we have more, we need multiple embeds.
+	// Simple pagination logic:
+	chunkSize := 25
+	for i := 0; i < len(fields); i += chunkSize {
+		end := i + chunkSize
+		if end > len(fields) {
+			end = len(fields)
+		}
+
+		title := fmt.Sprintf("Party Plan (Week %d)", weekNumber)
+		if i > 0 {
+			title += fmt.Sprintf(" - Part %d", i/chunkSize+1)
+		}
+
+		embeds = append(embeds, &discordgo.MessageEmbed{
+			Title:       title,
+			Description: "Suggested groups to minimize party switching and optimize keys.",
+			Color:       0xe91e63, // Pink color
+			Fields:      fields[i:end],
+		})
+	}
+
+	s.ChannelMessageSendEmbeds(m.ChannelID, embeds)
+}
+
 func (h *questsHandler) handleBossPing(ctx context.Context, s *discordgo.Session, m *discordgo.MessageCreate, bossName string) {
 	l := ctxzap.Extract(ctx)
 
@@ -868,104 +1359,6 @@ func (h *questsHandler) handleBossPing(ctx context.Context, s *discordgo.Session
 	s.ChannelMessageSendEmbeds(m.ChannelID, []*discordgo.MessageEmbed{embed})
 }
 
-func (h *questsHandler) handleWho(ctx context.Context, s *discordgo.Session, m *discordgo.MessageCreate, args []string) {
-	l := ctxzap.Extract(ctx)
-
-	var weekNumber, year int
-	var err error
-
-	if len(args) > 0 {
-		weekNumber, year, err = parseWeekOrDate(args[0])
-		if err != nil {
-			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Invalid week/date format: %s. Use ISO week number (1-53) or date (YYYY-MM-DD)", args[0]))
-			return
-		}
-	} else {
-		weekNumber, year = getCurrentWeek()
-	}
-
-	questsList, err := h.db.GetAllQuestsForWeek(ctx, weekNumber, year)
-	if err != nil {
-		l.Error("Failed to get quests", zap.Error(err))
-		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Error getting quests: %s", err.Error()))
-		return
-	}
-
-	if len(questsList) == 0 {
-		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("No quests found for week %d of %d", weekNumber, year))
-		return
-	}
-
-	// Group by boss, then by player
-	type PlayerKeyInfo struct {
-		PlayerName string
-		KeyCount   int
-	}
-
-	bossPlayers := make(map[string][]PlayerKeyInfo)
-
-	for _, quest := range questsList {
-		remainingKills := quest.RequiredKills - quest.CurrentKills
-		if remainingKills <= 0 {
-			continue
-		}
-
-		// Keys = remaining kills
-		keyCount := remainingKills
-
-		bossPlayers[quest.BossName] = append(bossPlayers[quest.BossName], PlayerKeyInfo{
-			PlayerName: quest.PlayerName,
-			KeyCount:   keyCount,
-		})
-	}
-
-	if len(bossPlayers) == 0 {
-		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("No key requirements for week %d of %d (all quests completed)", weekNumber, year))
-		return
-	}
-
-	// Sort bosses alphabetically
-	bossNames := make([]string, 0, len(bossPlayers))
-	for bossName := range bossPlayers {
-		bossNames = append(bossNames, bossName)
-	}
-	sort.Strings(bossNames)
-
-	// Build embed fields - one field per boss
-	fields := make([]*discordgo.MessageEmbedField, 0, len(bossNames))
-	for _, bossName := range bossNames {
-		players := bossPlayers[bossName]
-		
-		// Sort players by key count (descending), then by name
-		sort.Slice(players, func(i, j int) bool {
-			if players[i].KeyCount != players[j].KeyCount {
-				return players[i].KeyCount > players[j].KeyCount
-			}
-			return players[i].PlayerName < players[j].PlayerName
-		})
-
-		var value strings.Builder
-		for _, player := range players {
-			value.WriteString(fmt.Sprintf("%s: %d\n", player.PlayerName, player.KeyCount))
-		}
-
-		fields = append(fields, &discordgo.MessageEmbedField{
-			Name:   formatBossNameWithEmoji(bossName),
-			Value:  value.String(),
-			Inline: true,
-		})
-	}
-
-	embed := &discordgo.MessageEmbed{
-		Title:       "Who Has Keys",
-		Description: fmt.Sprintf("Week %d, %d", weekNumber, year),
-		Color:       0x9b59b6, // Purple color (same as help)
-		Fields:      fields,
-	}
-
-	s.ChannelMessageSendEmbeds(m.ChannelID, []*discordgo.MessageEmbed{embed})
-}
-
 // Helper functions
 
 // formatBossNameWithEmoji formats a boss name with its corresponding key color emoji
@@ -998,6 +1391,31 @@ func formatBossNameWithEmoji(bossName string) string {
 	}
 
 	return fieldName
+}
+
+// formatKeyTypeWithEmoji formats a key type with its corresponding color emoji
+func formatKeyTypeWithEmoji(keyType string) string {
+	colorEmoji := map[string]string{
+		"brown":        "🟤",
+		"gray":         "⚫",
+		"blue":         "🔵",
+		"gold":         "⭐",
+		"red":          "🔴",
+		"green":        "🟢",
+		"otherworldly": "💫",
+		"ancient":      "🏛️",
+		"book":         "📖",
+	}
+
+	keyColor, hasColor := quests.KeyToColor[keyType]
+	displayKey := cases.Title(language.English).String(keyType)
+	if hasColor {
+		emoji := colorEmoji[strings.ToLower(keyColor)]
+		if emoji != "" {
+			displayKey = fmt.Sprintf("%s %s", emoji, displayKey)
+		}
+	}
+	return displayKey
 }
 
 func getCurrentWeek() (weekNumber, year int) {

@@ -69,6 +69,23 @@ func (d *DB) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_weekly_quests_user_week ON weekly_quests(discord_user_id, week_number, year);
 	CREATE INDEX IF NOT EXISTS idx_weekly_quests_player_week ON weekly_quests(player_name, week_number, year);
 	CREATE INDEX IF NOT EXISTS idx_quest_kills_quest_id ON quest_kills(quest_id);
+	
+	CREATE TABLE IF NOT EXISTS player_keys (
+		discord_user_id TEXT NOT NULL,
+		key_type TEXT NOT NULL,
+		count INTEGER NOT NULL DEFAULT 0,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (discord_user_id, key_type)
+	);
+
+	CREATE TABLE IF NOT EXISTS player_alts (
+		discord_user_id TEXT NOT NULL,
+		player_name TEXT NOT NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (discord_user_id, player_name)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_player_alts_user ON player_alts(discord_user_id);
 	`
 
 	_, err := d.db.Exec(schema)
@@ -342,6 +359,7 @@ type PlayerQuestInfo struct {
 
 // GetPlayersWithMatchingQuests returns all players who have the same boss quests as the given player
 // A player matches if they have at least one of the same bosses
+// It also considers alts - the Discord user who owns each player (as main or alt) is returned
 func (d *DB) GetPlayersWithMatchingQuests(ctx context.Context, playerName string, weekNumber, year int) ([]PlayerQuestInfo, error) {
 	// First, get the boss names for the given player
 	playerBossesQuery := `
@@ -396,11 +414,38 @@ func (d *DB) GetPlayersWithMatchingQuests(ctx context.Context, playerName string
 
 	var results []PlayerQuestInfo
 	err = d.db.SelectContext(ctx, &results, query, args...)
-	return results, err
+	if err != nil {
+		return nil, err
+	}
+
+	// For each result, check if the player_name is owned by someone as main or alt
+	for i := range results {
+		pName := results[i].PlayerName
+
+		// Check if this player is someone's main
+		var ownerID string
+		mainQuery := `SELECT discord_user_id FROM players WHERE player_name = ?`
+		err := d.db.GetContext(ctx, &ownerID, mainQuery, pName)
+		if err == nil && ownerID != results[i].DiscordUserID {
+			results[i].DiscordUserID = ownerID
+			continue
+		}
+
+		// Check if this player is someone's alt
+		altQuery := `SELECT discord_user_id FROM player_alts WHERE player_name = ?`
+		err = d.db.GetContext(ctx, &altQuery, altQuery, pName)
+		if err == nil && ownerID != results[i].DiscordUserID {
+			results[i].DiscordUserID = ownerID
+		}
+	}
+
+	return results, nil
 }
 
 // GetPlayersWithBossQuest returns all players who have a quest for the specified boss
+// It also finds Discord users who own each player (as main or alt) so they can be pinged
 func (d *DB) GetPlayersWithBossQuest(ctx context.Context, bossName string, weekNumber, year int) ([]PlayerQuestInfo, error) {
+	// Get quests for this boss
 	query := `
 		SELECT wq.discord_user_id, wq.player_name, wq.boss_name, wq.required_kills, wq.current_kills
 		FROM weekly_quests wq
@@ -411,5 +456,225 @@ func (d *DB) GetPlayersWithBossQuest(ctx context.Context, bossName string, weekN
 
 	var results []PlayerQuestInfo
 	err := d.db.SelectContext(ctx, &results, query, weekNumber, year, bossName)
+	if err != nil {
+		return nil, err
+	}
+
+	// For each result, also check if the player_name is owned by someone else as main or alt
+	// This ensures the owner gets pinged even if they didn't submit the quest
+	for i := range results {
+		playerName := results[i].PlayerName
+		
+		// Check if this player is someone's main
+		var ownerID string
+		mainQuery := `SELECT discord_user_id FROM players WHERE player_name = ?`
+		err := d.db.GetContext(ctx, &ownerID, mainQuery, playerName)
+		if err == nil && ownerID != results[i].DiscordUserID {
+			// Player is owned by someone else - update to their discord_user_id
+			results[i].DiscordUserID = ownerID
+			continue
+		}
+		
+		// Check if this player is someone's alt
+		altQuery := `SELECT discord_user_id FROM player_alts WHERE player_name = ?`
+		err = d.db.GetContext(ctx, &ownerID, altQuery, playerName)
+		if err == nil && ownerID != results[i].DiscordUserID {
+			// Player is an alt owned by someone else - update to their discord_user_id
+			results[i].DiscordUserID = ownerID
+		}
+	}
+
+	return results, nil
+}
+
+// UpsertPlayerKeys updates the key count for a specific key type for a player
+func (d *DB) UpsertPlayerKeys(ctx context.Context, discordUserID string, keyType string, count int) error {
+	l := ctxzap.Extract(ctx)
+	
+	query := `
+		INSERT INTO player_keys (discord_user_id, key_type, count, updated_at)
+		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(discord_user_id, key_type) DO UPDATE SET
+			count = excluded.count,
+			updated_at = CURRENT_TIMESTAMP
+	`
+	
+	_, err := d.db.ExecContext(ctx, query, discordUserID, keyType, count)
+	if err != nil {
+		l.Error("Failed to upsert player keys", zap.Error(err), zap.String("user_id", discordUserID), zap.String("key", keyType), zap.Int("count", count))
+		return err
+	}
+	
+	return nil
+}
+
+// GetPlayerKeys returns all key counts for a player
+func (d *DB) GetPlayerKeys(ctx context.Context, discordUserID string) (map[string]int, error) {
+	query := `SELECT key_type, count FROM player_keys WHERE discord_user_id = ?`
+	
+	type keyRow struct {
+		KeyType string `db:"key_type"`
+		Count   int    `db:"count"`
+	}
+	
+	var rows []keyRow
+	err := d.db.SelectContext(ctx, &rows, query, discordUserID)
+	if err != nil {
+		return nil, err
+	}
+	
+	result := make(map[string]int)
+	for _, row := range rows {
+		result[row.KeyType] = row.Count
+	}
+	
+	return result, nil
+}
+
+// GetPlayerKeyCount returns the count for a specific key type
+func (d *DB) GetPlayerKeyCount(ctx context.Context, discordUserID string, keyType string) (int, error) {
+	var count int
+	query := `SELECT count FROM player_keys WHERE discord_user_id = ? AND key_type = ?`
+	
+	err := d.db.GetContext(ctx, &count, query, discordUserID, keyType)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	
+	return count, nil
+}
+
+// PlayerKeyEntry represents a key entry with player name
+type PlayerKeyEntry struct {
+	PlayerName string `db:"player_name"`
+	KeyType    string `db:"key_type"`
+	Count      int    `db:"count"`
+}
+
+// GetAllPlayerKeys returns all keys for all players
+func (d *DB) GetAllPlayerKeys(ctx context.Context) ([]PlayerKeyEntry, error) {
+	query := `
+		SELECT p.player_name, pk.key_type, pk.count
+		FROM player_keys pk
+		JOIN players p ON pk.discord_user_id = p.discord_user_id
+		WHERE pk.count > 0
+		ORDER BY pk.key_type, p.player_name
+	`
+	var results []PlayerKeyEntry
+	err := d.db.SelectContext(ctx, &results, query)
 	return results, err
+}
+
+// GetPlayerKeysByName returns all key counts for a player by name
+func (d *DB) GetPlayerKeysByName(ctx context.Context, playerName string) (map[string]int, error) {
+	query := `
+		SELECT pk.key_type, pk.count 
+		FROM player_keys pk
+		JOIN players p ON pk.discord_user_id = p.discord_user_id
+		WHERE p.player_name = ?
+	`
+	
+	type keyRow struct {
+		KeyType string `db:"key_type"`
+		Count   int    `db:"count"`
+	}
+	
+	var rows []keyRow
+	err := d.db.SelectContext(ctx, &rows, query, playerName)
+	if err != nil {
+		return nil, err
+	}
+	
+	result := make(map[string]int)
+	for _, row := range rows {
+		result[row.KeyType] = row.Count
+	}
+	
+	return result, nil
+}
+
+// RegisterAlt adds an alternate player name for a Discord user
+func (d *DB) RegisterAlt(ctx context.Context, discordUserID, playerName string) error {
+	l := ctxzap.Extract(ctx)
+	l.Info("Registering alt", zap.String("discord_user_id", discordUserID), zap.String("player_name", playerName))
+
+	query := `
+		INSERT INTO player_alts (discord_user_id, player_name, created_at)
+		VALUES (?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(discord_user_id, player_name) DO NOTHING
+	`
+	_, err := d.db.ExecContext(ctx, query, discordUserID, playerName)
+	return err
+}
+
+// RemoveAlt removes an alternate player name for a Discord user
+func (d *DB) RemoveAlt(ctx context.Context, discordUserID, playerName string) error {
+	l := ctxzap.Extract(ctx)
+	l.Info("Removing alt", zap.String("discord_user_id", discordUserID), zap.String("player_name", playerName))
+
+	query := `DELETE FROM player_alts WHERE discord_user_id = ? AND player_name = ?`
+	_, err := d.db.ExecContext(ctx, query, discordUserID, playerName)
+	return err
+}
+
+// GetAlts returns all alternate player names for a Discord user
+func (d *DB) GetAlts(ctx context.Context, discordUserID string) ([]string, error) {
+	query := `SELECT player_name FROM player_alts WHERE discord_user_id = ? ORDER BY player_name`
+	
+	var alts []string
+	err := d.db.SelectContext(ctx, &alts, query, discordUserID)
+	if err != nil {
+		return nil, err
+	}
+	
+	return alts, nil
+}
+
+// GetAllPlayerNames returns all player names for a Discord user (main + alts)
+func (d *DB) GetAllPlayerNames(ctx context.Context, discordUserID string) ([]string, error) {
+	var names []string
+	
+	// Get main player name
+	mainName, err := d.GetPlayerName(ctx, discordUserID)
+	if err == nil && mainName != "" {
+		names = append(names, mainName)
+	}
+	
+	// Get alts
+	alts, err := d.GetAlts(ctx, discordUserID)
+	if err != nil {
+		return names, err
+	}
+	
+	names = append(names, alts...)
+	return names, nil
+}
+
+// GetDiscordUserIDForPlayer returns the Discord user ID for a player name (checking both main and alts)
+func (d *DB) GetDiscordUserIDForPlayer(ctx context.Context, playerName string) (string, error) {
+	// Check main players table first
+	var discordUserID string
+	query := `SELECT discord_user_id FROM players WHERE player_name = ?`
+	err := d.db.GetContext(ctx, &discordUserID, query, playerName)
+	if err == nil {
+		return discordUserID, nil
+	}
+	if err != sql.ErrNoRows {
+		return "", err
+	}
+	
+	// Check alts table
+	query = `SELECT discord_user_id FROM player_alts WHERE player_name = ?`
+	err = d.db.GetContext(ctx, &discordUserID, query, playerName)
+	if err == sql.ErrNoRows {
+		return "", fmt.Errorf("player not found")
+	}
+	if err != nil {
+		return "", err
+	}
+	
+	return discordUserID, nil
 }
