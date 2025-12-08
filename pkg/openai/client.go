@@ -161,6 +161,110 @@ func (c *Client) ChatCompletionWithImageJSON(systemPrompt, userPrompt, imageBase
 	return &chatResp, nil
 }
 
+// ReferenceImage represents a labeled reference image for few-shot learning
+type ReferenceImage struct {
+	Label      string // e.g., "mountain", "godly"
+	Base64Data string // base64-encoded image data
+	MimeType   string // e.g., "image/png"
+}
+
+// ChatCompletionWithReferences sends a chat completion with reference images followed by the main image
+func (c *Client) ChatCompletionWithReferences(systemPrompt, userPrompt string, references []ReferenceImage, mainImageBase64, mainImageType string, forceJSON bool) (*ChatResponse, error) {
+	// Build content array with reference images first, then the main image
+	content := []MessageContent{
+		{
+			Type: "text",
+			Text: userPrompt,
+		},
+	}
+
+	// Add reference images with labels
+	for _, ref := range references {
+		// Add label for this reference
+		content = append(content, MessageContent{
+			Type: "text",
+			Text: fmt.Sprintf("[Reference: %s key]", ref.Label),
+		})
+		// Add the reference image
+		dataURL := fmt.Sprintf("data:%s;base64,%s", ref.MimeType, ref.Base64Data)
+		content = append(content, MessageContent{
+			Type: "image_url",
+			ImageURL: &ImageURL{
+				URL:    dataURL,
+				Detail: "low", // Use low detail for reference images to save tokens
+			},
+		})
+	}
+
+	// Add separator and main image
+	content = append(content, MessageContent{
+		Type: "text",
+		Text: "[Image to analyze:]",
+	})
+	mainDataURL := fmt.Sprintf("data:%s;base64,%s", mainImageType, mainImageBase64)
+	content = append(content, MessageContent{
+		Type: "image_url",
+		ImageURL: &ImageURL{
+			URL:    mainDataURL,
+			Detail: "high", // Use high detail for the main image
+		},
+	})
+
+	messages := []ChatMessage{
+		{
+			Role:    "system",
+			Content: systemPrompt,
+		},
+		{
+			Role:    "user",
+			Content: content,
+		},
+	}
+
+	req := &ChatRequest{
+		Model:               c.model,
+		Messages:            messages,
+		Temperature:         0.1,
+		MaxCompletionTokens: 1000,
+	}
+
+	if forceJSON {
+		req.ResponseFormat = &ResponseFormat{Type: "json_object"}
+	}
+
+	jsonData, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.apiKey))
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var chatResp ChatResponse
+	if err := json.Unmarshal(body, &chatResp); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return &chatResp, nil
+}
+
 // GetResponseContent extracts the text content from a chat response
 func GetResponseContent(resp *ChatResponse) string {
 	if resp == nil || len(resp.Choices) == 0 {

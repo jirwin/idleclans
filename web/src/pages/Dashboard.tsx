@@ -111,7 +111,15 @@ export function Dashboard() {
   };
 
   // Screenshot upload handlers
+  const MAX_IMAGE_SIZE = 2 * 1024 * 1024; // 2MB
+
   const handleScreenshotUpload = async (file: File, type: 'quests' | 'keys') => {
+    // Check file size
+    if (file.size > MAX_IMAGE_SIZE) {
+      setUploadError(`Image too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Maximum size is 2MB.`);
+      return;
+    }
+
     setUploadingScreenshot(type);
     setUploadError(null);
 

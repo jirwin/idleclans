@@ -49,16 +49,17 @@ type DiscordMessageSender interface {
 
 // Server represents the web server
 type Server struct {
-	config        *Config
-	db            *quests.DB
-	logger        *zap.Logger
-	publicServer  *http.Server
-	adminServer   *http.Server
-	sessionStore  *SessionStore
-	sseBroker     *SSEBroker
-	icClient      *idleclans.Client
-	discordSender DiscordMessageSender
-	openaiClient  *openai.Client
+	config            *Config
+	db                *quests.DB
+	logger            *zap.Logger
+	publicServer      *http.Server
+	adminServer       *http.Server
+	sessionStore      *SessionStore
+	sseBroker         *SSEBroker
+	icClient          *idleclans.Client
+	discordSender     DiscordMessageSender
+	openaiClient      *openai.Client
+	keyReferenceImages *KeyReferenceImages
 }
 
 // SetDiscordSender sets the Discord message sender
@@ -89,6 +90,9 @@ func NewServer(config *Config, db *quests.DB, logger *zap.Logger) (*Server, erro
 		}
 		s.openaiClient = openai.NewClient(config.OpenAIAPIKey, model)
 		logger.Info("OpenAI client initialized", zap.String("model", model))
+
+		// Load embedded key reference images
+		s.keyReferenceImages = NewKeyReferenceImages(logger)
 	}
 
 	return s, nil

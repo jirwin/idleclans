@@ -17,6 +17,7 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 
+	"github.com/jirwin/idleclans/pkg/openai"
 	"github.com/jirwin/idleclans/pkg/quests"
 	"go.uber.org/zap"
 )
@@ -1383,29 +1384,44 @@ Key 2: [COLOR] [SHAPE], number: [NUMBER]
 
 Be thorough - describe EVERY key tile you can see, from left to right.`
 
-// keyAnalysisPrompt is a simple single-pass prompt (used by authenticated endpoint)
-const keyAnalysisPrompt = `Analyze this inventory screenshot from IdleClans. Find all KEYS and the KRONOS BOOK.
+// keyAnalysisPrompt is the prompt without reference images
+const keyAnalysisPrompt = `Analyze this inventory screenshot from IdleClans. Find ONLY boss keys and the Kronos book.
 
-ONLY include items that:
-1. Look like a KEY (has a key shape with a handle and teeth/blade) OR is the Kronos book (red/brown book with spots)
-2. Have a visible orange number on them
+STRICT RULES:
+1. ONLY include items that have a DISTINCT KEY SHAPE (handle + teeth/blade) or the Kronos book
+2. The item MUST have a visible orange/yellow number displayed on it
+3. IGNORE greyed-out or faded items - they are not valid
+4. IGNORE ores, rocks, gems, tools, or any non-key items even if they have numbers
+5. Stone keys are GRAY/SILVER colored keys - do NOT confuse with brown/tan ore rocks
 
-IGNORE anything that doesn't look like a key or the Kronos book - even if it has a number.
+KEY IDENTIFICATION (by color AND shape):
+- Brown/tan KEY shape = "mountain"
+- Gold/yellow KEY shape = "godly"
+- Red KEY shape = "burning"
+- Dark blue KEY shape = "underworld"
+- Green KEY shape = "mutated"
+- Gray/silver KEY shape = "stone" (NOT rocks or ore)
+- White KEY shape = "ancient"
+- Cyan/light blue KEY shape = "otherworldly"
+- Red/brown BOOK with spots = "kronos"
 
-KEY COLORS:
-- Brown/tan/orange key = "mountain"
-- Gold/yellow key = "godly"
-- Red key = "burning"
-- Dark blue key = "underworld"
-- Green key = "mutated"
-- Gray/silver key = "stone"
-- White key = "ancient"
-- Cyan/light blue key = "otherworldly"
-- Red/brown book with spots = "kronos"
+IMPORTANT: Ore and rocks are NOT keys. If it doesn't have a clear key shape (handle + teeth), skip it.
 
-Numbers with K suffix: 71.8K = 71800
+Return JSON with only confirmed keys: {"keys":[{"type":"godly","count":39}]}`
 
-Return JSON: {"keys":[{"type":"mountain","count":71800},{"type":"godly","count":39}]}`
+// keyAnalysisPromptWithRefs is the prompt when reference images are provided
+const keyAnalysisPromptWithRefs = `Analyze the inventory screenshot to find boss keys and the Kronos book.
+
+I've provided reference images showing what each key type looks like. Use these to identify keys in the main image.
+
+STRICT RULES:
+1. Match items to the reference images - only include items that look like the reference keys
+2. The item MUST have a visible orange/yellow number displayed on it
+3. IGNORE greyed-out or faded items
+4. IGNORE ores, rocks, gems, tools - they are NOT keys even if they have numbers
+5. If an item doesn't match any reference image, skip it
+
+Return JSON with only confirmed keys: {"keys":[{"type":"godly","count":39}]}`
 
 // keyParsePrompt converts the description to JSON
 const keyParsePrompt = `Convert this key description to JSON.
@@ -1470,8 +1486,8 @@ func (s *Server) handleAnalyzeQuests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse multipart form (max 10MB)
-	if err := r.ParseMultipartForm(10 << 20); err != nil {
+	// Parse multipart form (max 2MB)
+	if err := r.ParseMultipartForm(2 << 20); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(AnalyzeQuestsResponse{Error: "Failed to parse form: " + err.Error()})
@@ -1488,8 +1504,16 @@ func (s *Server) handleAnalyzeQuests(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// Read the image data
-	imageData, err := io.ReadAll(file)
+	// Check file size (max 2MB)
+	if header.Size > 2<<20 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(AnalyzeQuestsResponse{Error: "Image too large. Maximum size is 2MB."})
+		return
+	}
+
+	// Read the image data (with limit as safety)
+	imageData, err := io.ReadAll(io.LimitReader(file, 2<<20+1))
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -1619,8 +1643,8 @@ func (s *Server) handleAnalyzeKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse multipart form (max 10MB)
-	if err := r.ParseMultipartForm(10 << 20); err != nil {
+	// Parse multipart form (max 2MB)
+	if err := r.ParseMultipartForm(2 << 20); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Failed to parse form: " + err.Error()})
@@ -1637,8 +1661,16 @@ func (s *Server) handleAnalyzeKeys(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// Read the image data
-	imageData, err := io.ReadAll(file)
+	// Check file size (max 2MB)
+	if header.Size > 2<<20 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Image too large. Maximum size is 2MB."})
+		return
+	}
+
+	// Read the image data (with limit as safety)
+	imageData, err := io.ReadAll(io.LimitReader(file, 2<<20+1))
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -1655,14 +1687,26 @@ func (s *Server) handleAnalyzeKeys(w http.ResponseWriter, r *http.Request) {
 	// Encode to base64
 	imageBase64 := base64.StdEncoding.EncodeToString(imageData)
 
-	// Call OpenAI with JSON mode
-	resp, err := s.openaiClient.ChatCompletionWithImageJSON(
-		keyAnalysisPrompt,
-		"Please analyze this key inventory screenshot and extract the key counts.",
-		imageBase64,
-		imageType,
-		true, // Force JSON output
-	)
+	// Call OpenAI with JSON mode - use reference images if available
+	var resp *openai.ChatResponse
+	if s.keyReferenceImages != nil && s.keyReferenceImages.HasImages() {
+		resp, err = s.openaiClient.ChatCompletionWithReferences(
+			keyAnalysisPromptWithRefs,
+			"Analyze this key inventory screenshot. Match keys to the reference images provided.",
+			s.keyReferenceImages.GetImages(),
+			imageBase64,
+			imageType,
+			true, // Force JSON output
+		)
+	} else {
+		resp, err = s.openaiClient.ChatCompletionWithImageJSON(
+			keyAnalysisPrompt,
+			"Please analyze this key inventory screenshot and extract the key counts.",
+			imageBase64,
+			imageType,
+			true, // Force JSON output
+		)
+	}
 	if err != nil {
 		s.logger.Error("Failed to analyze key screenshot", zap.Error(err))
 		w.Header().Set("Content-Type", "application/json")
@@ -1685,10 +1729,11 @@ func (s *Server) handleAnalyzeKeys(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate and convert results
+	// Filter out invalid counts (> 300 is likely misdetection of non-key items)
 	results := make([]KeyCountResult, 0)
 	for _, k := range llmResp.Keys {
 		keyType, ok := quests.ResolveKeyType(k.Type)
-		if ok && k.Count > 0 {
+		if ok && k.Count > 0 && k.Count <= 300 {
 			results = append(results, KeyCountResult{
 				Type:  keyType,
 				Count: k.Count,
@@ -1892,8 +1937,8 @@ func (s *Server) handleAdminAnalyzeQuests(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Parse multipart form (max 10MB)
-	if err := r.ParseMultipartForm(10 << 20); err != nil {
+	// Parse multipart form (max 2MB)
+	if err := r.ParseMultipartForm(2 << 20); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(AnalyzeQuestsResponse{Error: "Failed to parse form: " + err.Error()})
@@ -1910,8 +1955,16 @@ func (s *Server) handleAdminAnalyzeQuests(w http.ResponseWriter, r *http.Request
 	}
 	defer file.Close()
 
-	// Read the image data
-	imageData, err := io.ReadAll(file)
+	// Check file size (max 2MB)
+	if header.Size > 2<<20 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(AnalyzeQuestsResponse{Error: "Image too large. Maximum size is 2MB."})
+		return
+	}
+
+	// Read the image data (with limit as safety)
+	imageData, err := io.ReadAll(io.LimitReader(file, 2<<20+1))
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -1989,8 +2042,8 @@ func (s *Server) handleAdminAnalyzeKeys(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Parse multipart form (max 10MB)
-	if err := r.ParseMultipartForm(10 << 20); err != nil {
+	// Parse multipart form (max 2MB)
+	if err := r.ParseMultipartForm(2 << 20); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Failed to parse form: " + err.Error()})
@@ -2007,8 +2060,16 @@ func (s *Server) handleAdminAnalyzeKeys(w http.ResponseWriter, r *http.Request) 
 	}
 	defer file.Close()
 
-	// Read the image data
-	imageData, err := io.ReadAll(file)
+	// Check file size (max 2MB)
+	if header.Size > 2<<20 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Image too large. Maximum size is 2MB."})
+		return
+	}
+
+	// Read the image data (with limit as safety)
+	imageData, err := io.ReadAll(io.LimitReader(file, 2<<20+1))
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -2036,14 +2097,28 @@ func (s *Server) handleAdminAnalyzeKeys(w http.ResponseWriter, r *http.Request) 
 
 	imageBase64 := base64.StdEncoding.EncodeToString(imageData)
 
-	// Single pass with JSON mode using OpenAI
-	resp, err := s.openaiClient.ChatCompletionWithImageJSON(
-		keyAnalysisPrompt,
-		"Please analyze this key inventory screenshot and extract the key counts.",
-		imageBase64,
-		imageType,
-		true, // Force JSON output
-	)
+	// Single pass with JSON mode using OpenAI - use reference images if available
+	var resp *openai.ChatResponse
+	if s.keyReferenceImages != nil && s.keyReferenceImages.HasImages() {
+		s.logger.Info("Using reference images for key analysis",
+			zap.Int("ref_count", len(s.keyReferenceImages.GetImages())))
+		resp, err = s.openaiClient.ChatCompletionWithReferences(
+			keyAnalysisPromptWithRefs,
+			"Analyze this key inventory screenshot. Match keys to the reference images provided.",
+			s.keyReferenceImages.GetImages(),
+			imageBase64,
+			imageType,
+			true, // Force JSON output
+		)
+	} else {
+		resp, err = s.openaiClient.ChatCompletionWithImageJSON(
+			keyAnalysisPrompt,
+			"Please analyze this key inventory screenshot and extract the key counts.",
+			imageBase64,
+			imageType,
+			true, // Force JSON output
+		)
+	}
 	if err != nil {
 		s.logger.Error("Failed to analyze keys", zap.Error(err))
 		w.Header().Set("Content-Type", "application/json")
@@ -2067,10 +2142,11 @@ func (s *Server) handleAdminAnalyzeKeys(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Validate and convert results
+	// Filter out invalid counts (> 300 is likely misdetection of non-key items)
 	results := make([]KeyCountResult, 0)
 	for _, k := range llmResp.Keys {
 		keyType, ok := quests.ResolveKeyType(k.Type)
-		if ok && k.Count > 0 {
+		if ok && k.Count > 0 && k.Count <= 300 {
 			results = append(results, KeyCountResult{
 				Type:  keyType,
 				Count: k.Count,
@@ -2142,8 +2218,9 @@ func (s *Server) analyzeKeyTiles(tiles [][]byte, splitInfo *ImageSplitInfo) []Ke
 				zap.Int("count", keyResp.Count))
 		}
 
-		// Only add if we got a valid key type and count > 0
-		if keyResp != nil && keyResp.Count > 0 {
+		// Only add if we got a valid key type and count > 0 and <= 300
+		// (counts over 300 are likely misdetection of non-key items)
+		if keyResp != nil && keyResp.Count > 0 && keyResp.Count <= 300 {
 			keyType, ok := quests.ResolveKeyType(keyResp.Type)
 			if ok {
 				results = append(results, KeyCountResult{

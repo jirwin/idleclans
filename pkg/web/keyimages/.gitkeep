@@ -1,0 +1,14 @@
+# Place key reference images here
+# Expected filenames:
+# - mountain.png (brown/tan key)
+# - godly.png (gold/yellow key)
+# - burning.png (red key)
+# - underworld.png (dark blue key)
+# - mutated.png (green key)
+# - stone.png (gray/silver key)
+# - ancient.png (white key)
+# - otherworldly.png (cyan/light blue key)
+# - kronos.png (the Kronos book)
+#
+# Images will be embedded in the binary at build time.
+
