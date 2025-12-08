@@ -1,4 +1,4 @@
-import type { UserData, PlayerData, ClanBossData, ClanKeysData, PlanData, PartySession } from './types';
+import type { UserData, PlayerData, ClanBossData, ClanKeysData, PlanData, PartySession, PartySummary } from './types';
 
 const API_BASE = '/api';
 
@@ -362,6 +362,22 @@ export async function analyzeKeysScreenshot(image: File): Promise<AnalyzeKeysRes
 }
 
 // Party API functions
+
+export async function getUserParties(): Promise<PartySummary[]> {
+  const res = await fetch(`${API_BASE}/parties`, {
+    credentials: 'include',
+  });
+
+  if (res.status === 401) {
+    throw new Error('Unauthorized');
+  }
+
+  if (!res.ok) {
+    throw new Error(`Failed to get parties: ${res.statusText}`);
+  }
+
+  return res.json();
+}
 
 export async function createParty(players: string[]): Promise<{ id: string }> {
   const res = await fetch(`${API_BASE}/parties`, {

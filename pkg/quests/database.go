@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
@@ -56,7 +57,7 @@ func (d *DB) initSchema() error {
 		current_kills INTEGER DEFAULT 0,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		UNIQUE(discord_user_id, week_number, year, boss_name)
+		UNIQUE(discord_user_id, player_name, week_number, year, boss_name)
 	);
 
 	CREATE TABLE IF NOT EXISTS quest_kills (
@@ -140,6 +141,13 @@ func (d *DB) initSchema() error {
 	// This handles both new columns (which will be NULL) and ensures consistency
 	_, _ = d.db.Exec(`UPDATE weekly_quests SET max_required_kills = required_kills WHERE max_required_kills IS NULL`)
 
+	// Migration: Fix unique constraint to include player_name (allows separate quests for main and alts)
+	// SQLite doesn't support dropping constraints, so we need to recreate the table
+	if err := d.migrateWeeklyQuestsUniqueConstraint(); err != nil {
+		// Log but don't fail - migration errors shouldn't prevent startup
+		fmt.Printf("Warning: Failed to migrate weekly_quests unique constraint: %v\n", err)
+	}
+
 	// Migration: Convert player_keys from discord_user_id to player_name
 	// Check if old schema exists (has discord_user_id column)
 	var hasOldSchema bool
@@ -154,6 +162,103 @@ func (d *DB) initSchema() error {
 			return fmt.Errorf("failed to migrate player_keys: %w", err)
 		}
 	}
+
+	return nil
+}
+
+// migrateWeeklyQuestsUniqueConstraint migrates the weekly_quests table to include player_name in unique constraint
+func (d *DB) migrateWeeklyQuestsUniqueConstraint() error {
+	// Check if migration is needed by checking if the old constraint exists
+	// We can detect this by checking if there are any duplicate player_name entries for same discord_user_id/boss/week/year
+	// But simpler: just check if table exists and try to create the new constraint index
+	// If it fails due to duplicates, we need to clean up first
+	
+	// First, try to create the new unique index
+	_, err := d.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_weekly_quests_unique_new ON weekly_quests(discord_user_id, player_name, week_number, year, boss_name)`)
+	if err != nil {
+		// If this fails, there might be duplicates - we need to handle them
+		// For now, just return the error - the old constraint will still work
+		return fmt.Errorf("failed to create new unique index (may have duplicates): %w", err)
+	}
+
+	// Check if we have the old constraint by trying to insert a test (we'll rollback)
+	// Actually, simpler: just recreate the table if we detect conflicts
+	// But that's risky. Let's try a different approach:
+	// Create a new table, copy data, then swap
+	
+	// Check if old table has the constraint by checking schema
+	var oldConstraintExists bool
+	row := d.db.QueryRow(`
+		SELECT sql FROM sqlite_master 
+		WHERE type='table' AND name='weekly_quests'
+	`)
+	var tableSQL string
+	if err := row.Scan(&tableSQL); err == nil {
+		// Check if the SQL contains the old constraint (without player_name)
+		if strings.Contains(tableSQL, "UNIQUE(discord_user_id, week_number, year, boss_name)") {
+			oldConstraintExists = true
+		}
+	}
+
+	if !oldConstraintExists {
+		// Already migrated or new database
+		return nil
+	}
+
+	// Need to recreate table - create new one with correct constraint
+	_, err = d.db.Exec(`
+		CREATE TABLE IF NOT EXISTS weekly_quests_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			discord_user_id TEXT NOT NULL,
+			player_name TEXT NOT NULL,
+			week_number INTEGER NOT NULL,
+			year INTEGER NOT NULL,
+			boss_name TEXT NOT NULL,
+			required_kills INTEGER NOT NULL,
+			max_required_kills INTEGER NOT NULL,
+			current_kills INTEGER DEFAULT 0,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(discord_user_id, player_name, week_number, year, boss_name)
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create new table: %w", err)
+	}
+
+	// Copy all data - the old constraint prevented duplicates, so this should be safe
+	_, err = d.db.Exec(`
+		INSERT INTO weekly_quests_new 
+		(id, discord_user_id, player_name, week_number, year, boss_name, required_kills, max_required_kills, current_kills, created_at, updated_at)
+		SELECT 
+			id, discord_user_id, player_name, week_number, year, boss_name, 
+			required_kills, max_required_kills, current_kills, created_at, updated_at
+		FROM weekly_quests
+	`)
+	if err != nil {
+		// Cleanup on failure
+		d.db.Exec(`DROP TABLE IF EXISTS weekly_quests_new`)
+		return fmt.Errorf("failed to copy data: %w", err)
+	}
+
+	// Update quest_kills foreign keys to point to new IDs (they should match)
+	// Actually, IDs should be preserved, so foreign keys should still work
+
+	// Drop old table
+	_, err = d.db.Exec(`DROP TABLE weekly_quests`)
+	if err != nil {
+		return fmt.Errorf("failed to drop old table: %w", err)
+	}
+
+	// Rename new table
+	_, err = d.db.Exec(`ALTER TABLE weekly_quests_new RENAME TO weekly_quests`)
+	if err != nil {
+		return fmt.Errorf("failed to rename table: %w", err)
+	}
+
+	// Recreate indexes
+	_, _ = d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_weekly_quests_user_week ON weekly_quests(discord_user_id, week_number, year)`)
+	_, _ = d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_weekly_quests_player_week ON weekly_quests(player_name, week_number, year)`)
 
 	return nil
 }
@@ -329,8 +434,8 @@ func (d *DB) UpsertQuest(ctx context.Context, discordUserID, playerName string, 
 	// First, get the existing quest if it exists
 	var existing WeeklyQuestRow
 	query := `SELECT id, required_kills, max_required_kills, current_kills FROM weekly_quests 
-		WHERE discord_user_id = ? AND week_number = ? AND year = ? AND boss_name = ?`
-	err := d.db.GetContext(ctx, &existing, query, discordUserID, weekNumber, year, bossName)
+		WHERE discord_user_id = ? AND player_name = ? AND week_number = ? AND year = ? AND boss_name = ?`
+	err := d.db.GetContext(ctx, &existing, query, discordUserID, playerName, weekNumber, year, bossName)
 
 	if err == sql.ErrNoRows {
 		// Insert new quest - max_required_kills starts as required_kills
@@ -977,6 +1082,52 @@ func (d *DB) GetParty(ctx context.Context, id string) (*PartySession, error) {
 		return nil, err
 	}
 	return &party, nil
+}
+
+// GetPartiesForUser retrieves parties that include any of the user's characters (main or alts)
+// Returns active parties first, then recent completed ones, limited to 6 total
+func (d *DB) GetPartiesForUser(ctx context.Context, discordUserID string, limit int) ([]PartySession, error) {
+	// Get all player names for this user
+	playerNames, err := d.GetAllPlayerNames(ctx, discordUserID)
+	if err != nil {
+		return nil, err
+	}
+	if len(playerNames) == 0 {
+		return []PartySession{}, nil
+	}
+
+	// Use SQLite JSON functions to check if the players array contains any of our player names
+	// We'll use json_each to iterate through the array and check for matches
+	var conditions []string
+	var args []interface{}
+	for _, name := range playerNames {
+		// Use json_each to check if the name exists in the players JSON array
+		conditions = append(conditions, `EXISTS (
+			SELECT 1 FROM json_each(parties.players) 
+			WHERE json_each.value = ?
+		)`)
+		args = append(args, name)
+	}
+
+	whereClause := "(" + strings.Join(conditions, " OR ") + ")"
+
+	query := fmt.Sprintf(`
+		SELECT id, players, plan_data, current_step_index, started_at, ended_at, created_at 
+		FROM parties 
+		WHERE %s
+		ORDER BY 
+			CASE WHEN ended_at IS NULL THEN 0 ELSE 1 END,
+			COALESCE(started_at, created_at) DESC
+		LIMIT ?
+	`, whereClause)
+	args = append(args, limit)
+
+	var parties []PartySession
+	err = d.db.SelectContext(ctx, &parties, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return parties, nil
 }
 
 // StartParty marks the party as started

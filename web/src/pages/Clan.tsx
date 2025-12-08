@@ -1,8 +1,8 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import type { ClanBossData, ClanKeysData, PlanData } from '../types';
+import type { ClanBossData, ClanKeysData, PlanData, PartySummary } from '../types';
 import { BOSSES, KEY_TYPES } from '../types';
-import { fetchClanBosses, fetchClanKeys, fetchClanPlan, fetchClanPlayers, sendPlanToDiscord, createParty } from '../api';
+import { fetchClanBosses, fetchClanKeys, fetchClanPlan, fetchClanPlayers, sendPlanToDiscord, createParty, getUserParties } from '../api';
 import { useSSE } from '../hooks/useSSE';
 
 type TabType = 'bosses' | 'keys' | 'plan';
@@ -25,6 +25,7 @@ export function Clan() {
   const [sendError, setSendError] = useState<string | null>(null);
   const [sent, setSent] = useState(false);
   const [startingParty, setStartingParty] = useState(false);
+  const [userParties, setUserParties] = useState<PartySummary[]>([]);
   
   // Selected players for plan (up to 3)
   const [selectedPlayers, setSelectedPlayers] = useState<Set<string>>(new Set());
@@ -64,6 +65,15 @@ export function Clan() {
     }
   }, []);
 
+  const loadUserParties = useCallback(async () => {
+    try {
+      const parties = await getUserParties();
+      setUserParties(parties);
+    } catch (err) {
+      console.error('Failed to load user parties:', err);
+    }
+  }, []);
+
   // Use SSE for live updates
   useSSE({
     onUpdate: loadData,
@@ -72,7 +82,8 @@ export function Clan() {
 
   useEffect(() => {
     loadData();
-  }, [loadData]);
+    loadUserParties();
+  }, [loadData, loadUserParties]);
 
   // Auto-generate plan when players change
   useEffect(() => {
@@ -121,6 +132,8 @@ export function Clan() {
     setStartingParty(true);
     try {
       const result = await createParty(Array.from(selectedPlayers));
+      // Refresh parties list
+      await loadUserParties();
       navigate(`/party/${result.id}`);
     } catch (err) {
       console.error('Failed to start party:', err);
@@ -196,6 +209,65 @@ export function Clan() {
             My Quests
           </button>
         </header>
+
+        {/* User's Parties */}
+        {userParties.length > 0 && (
+          <div className="bg-[var(--color-bg-card)] rounded-xl border border-[var(--color-border)] mb-6 overflow-hidden">
+            <div className="px-4 py-3 border-b border-[var(--color-border)]">
+              <h2 className="font-semibold text-white text-sm flex items-center gap-2">
+                <span>🎮</span>
+                Your Parties
+              </h2>
+            </div>
+            <div className="p-4">
+              <div className="space-y-2">
+                {userParties.map((party) => {
+                  const isActive = !party.ended_at;
+                  const partyDate = party.started_at 
+                    ? new Date(party.started_at)
+                    : new Date(party.created_at);
+                  
+                  return (
+                    <div
+                      key={party.id}
+                      className={`flex items-center justify-between p-3 rounded-lg transition-colors ${
+                        isActive
+                          ? 'bg-pink-900/20 border border-pink-700/50'
+                          : 'bg-[var(--color-bg-dark)] border border-[var(--color-border)]'
+                      }`}
+                    >
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className={`text-sm font-medium ${isActive ? 'text-pink-300' : 'text-gray-300'}`}>
+                            {party.players.join(', ')}
+                          </span>
+                          {isActive && (
+                            <span className="px-2 py-0.5 text-xs bg-pink-600 text-white rounded-full">
+                              Active
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-xs text-gray-500 mt-1">
+                          {partyDate.toLocaleDateString()} {partyDate.toLocaleTimeString()}
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => navigate(`/party/${party.id}`)}
+                        className={`ml-4 px-4 py-2 text-sm font-medium rounded-lg transition-colors ${
+                          isActive
+                            ? 'bg-pink-600 hover:bg-pink-700 text-white'
+                            : 'bg-[var(--color-bg-input)] hover:bg-[var(--color-bg-dark)] text-gray-400 hover:text-white border border-[var(--color-border)]'
+                        }`}
+                      >
+                        {isActive ? 'Join' : 'View'}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Tabs */}
         <div className="flex gap-2 mb-6">

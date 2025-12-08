@@ -4,7 +4,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jirwin/idleclans/pkg/quests"
@@ -160,8 +162,107 @@ func (s *Server) handleCreateParty(w http.ResponseWriter, r *http.Request) {
 		zap.Strings("players", req.Players),
 	)
 
+	// Send Discord notification if configured
+	if s.discordSender != nil && s.config.DiscordChannelID != "" {
+		// Build ping string for party members
+		playerDiscordIDs := make(map[string]string)
+		for _, playerName := range req.Players {
+			discordID, err := s.db.GetDiscordUserIDForPlayer(ctx, playerName)
+			if err == nil && discordID != "" {
+				playerDiscordIDs[playerName] = discordID
+			}
+		}
+
+		seenIDs := make(map[string]bool)
+		var pings []string
+		for _, discordID := range playerDiscordIDs {
+			if !seenIDs[discordID] {
+				seenIDs[discordID] = true
+				pings = append(pings, fmt.Sprintf("<@%s>", discordID))
+			}
+		}
+		pingContent := strings.Join(pings, " ")
+
+		// Build party URL
+		partyURL := fmt.Sprintf("%s/party/%s", s.config.BaseURL, partyID)
+
+		// Create embed
+		embed := &DiscordEmbed{
+			Title:       "Party Started!",
+			Description: fmt.Sprintf("A party has been started with: %s", strings.Join(req.Players, ", ")),
+			Color:       0x5865F2, // Discord blurple
+			Fields: []DiscordEmbedField{
+				{
+					Name:   "Party Link",
+					Value:  fmt.Sprintf("[Join Party](%s)", partyURL),
+					Inline: false,
+				},
+			},
+		}
+
+		// Send notification (don't fail party creation if Discord fails)
+		if err := s.discordSender.SendMessageWithEmbed(s.config.DiscordChannelID, pingContent, embed); err != nil {
+			s.logger.Warn("Failed to send party notification to Discord",
+				zap.Error(err),
+				zap.String("party_id", partyID))
+		} else {
+			s.logger.Info("Sent party notification to Discord",
+				zap.String("party_id", partyID),
+				zap.Strings("players", req.Players))
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"id": partyID})
+}
+
+// handleGetUserParties returns parties the authenticated user has been part of
+func (s *Server) handleGetUserParties(w http.ResponseWriter, r *http.Request) {
+	session := getSession(r)
+	if session == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	ctx := r.Context()
+
+	// Get parties for this user (limit to 6: 1 current + 5 previous)
+	parties, err := s.db.GetPartiesForUser(ctx, session.UserID, 6)
+	if err != nil {
+		s.logger.Error("Failed to get user parties", zap.Error(err))
+		http.Error(w, "Failed to get parties", http.StatusInternalServerError)
+		return
+	}
+
+	// Convert to API format
+	partyResponses := make([]PartySummaryResponse, len(parties))
+	for i, party := range parties {
+		var players []string
+		if err := json.Unmarshal([]byte(party.Players), &players); err != nil {
+			s.logger.Warn("Failed to parse players", zap.String("party_id", party.ID), zap.Error(err))
+			players = []string{}
+		}
+
+		partyResponses[i] = PartySummaryResponse{
+			ID:        party.ID,
+			Players:   players,
+			StartedAt: party.StartedAt,
+			EndedAt:   party.EndedAt,
+			CreatedAt: party.CreatedAt,
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(partyResponses)
+}
+
+// PartySummaryResponse represents a summary of a party for listing
+type PartySummaryResponse struct {
+	ID        string     `json:"id"`
+	Players   []string   `json:"players"`
+	StartedAt *time.Time `json:"started_at"`
+	EndedAt   *time.Time `json:"ended_at"`
+	CreatedAt time.Time  `json:"created_at"`
 }
 
 // handleGetParty returns the full party state
@@ -364,6 +465,13 @@ func (s *Server) handleUpdatePartyKills(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	s.logger.Info("Party kill update request",
+		zap.String("party_id", partyID),
+		zap.String("user_id", session.UserID),
+		zap.Int("kills", req.Kills),
+		zap.Bool("delta", req.Delta),
+		zap.Any("expected_kills", req.ExpectedKills))
+
 	ctx := r.Context()
 
 	party, players, err := s.getPartyAndPlayers(ctx, partyID)
@@ -445,18 +553,41 @@ func (s *Server) handleUpdatePartyKills(w http.ResponseWriter, r *http.Request) 
 		keysUsed = progress.KeysUsed
 	}
 	if err := s.db.UpsertPartyStepProgress(ctx, partyID, party.CurrentStepIndex, currentTask.BossName, newKills, keysUsed); err != nil {
-		s.logger.Error("Failed to update step progress", zap.Error(err))
+		s.logger.Error("Failed to update step progress",
+			zap.Error(err),
+			zap.String("party_id", partyID),
+			zap.Int("step_index", party.CurrentStepIndex),
+			zap.String("boss", currentTask.BossName),
+			zap.Int("kills", newKills))
 		http.Error(w, "Failed to update kills", http.StatusInternalServerError)
 		return
 	}
+	s.logger.Info("Updated party step progress",
+		zap.String("party_id", partyID),
+		zap.Int("step_index", party.CurrentStepIndex),
+		zap.String("boss", currentTask.BossName),
+		zap.Int("old_kills", oldKills),
+		zap.Int("new_kills", newKills),
+		zap.Strings("players", players))
 
 	// Update quest current_kills for all players in the party who have this boss quest
 	killsDelta := newKills - oldKills
 	if killsDelta != 0 {
 		week, year := getWeekAndYear()
 		if err := s.db.IncrementQuestCurrentKills(ctx, players, currentTask.BossName, week, year, killsDelta); err != nil {
-			s.logger.Error("Failed to update quest kills", zap.Error(err))
-			// Don't fail the request, just log the error
+			s.logger.Error("Failed to update quest kills",
+				zap.Error(err),
+				zap.Strings("players", players),
+				zap.String("boss", currentTask.BossName),
+				zap.Int("delta", killsDelta),
+				zap.Int("week", week),
+				zap.Int("year", year))
+			// Don't fail the request, but log detailed error for debugging
+		} else {
+			s.logger.Info("Updated quest kills",
+				zap.Strings("players", players),
+				zap.String("boss", currentTask.BossName),
+				zap.Int("delta", killsDelta))
 		}
 	}
 

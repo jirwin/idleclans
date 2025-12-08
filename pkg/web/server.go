@@ -193,6 +193,7 @@ func (s *Server) setupPublicRoutes(mux *http.ServeMux) {
 
 	// Party routes (authenticated)
 	mux.HandleFunc("POST /api/parties", s.withAuth(s.handleCreateParty))
+	mux.HandleFunc("GET /api/parties", s.withAuth(s.handleGetUserParties))
 	mux.HandleFunc("GET /api/parties/{partyId}", s.withAuth(s.handleGetParty))
 	mux.HandleFunc("POST /api/parties/{partyId}/start", s.withAuth(s.handleStartPartyStep))
 	mux.HandleFunc("PUT /api/parties/{partyId}/kills", s.withAuth(s.handleUpdatePartyKills))

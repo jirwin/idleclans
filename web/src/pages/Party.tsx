@@ -302,8 +302,12 @@ export function Party() {
         setKillInput(result.kills.toString());
         updatePartyProgressOptimistically(result.kills);
       }
+      // Refresh full party data to update player_quests (small delay to ensure DB commit)
+      setTimeout(() => loadParty(), 100);
     } catch (err) {
       console.error('Failed to update kills:', err);
+      setConflictError(err instanceof Error ? err.message : 'Failed to update kills. Please try again.');
+      setTimeout(() => setConflictError(null), 5000);
       loadParty();
     } finally {
       pendingKillUpdateRef.current = false;
@@ -343,8 +347,12 @@ export function Party() {
         setKillInput(result.kills.toString());
         updatePartyProgressOptimistically(result.kills);
       }
+      // Refresh full party data to update player_quests (small delay to ensure DB commit)
+      setTimeout(() => loadParty(), 100);
     } catch (err) {
       console.error('Failed to update kills:', err);
+      setConflictError(err instanceof Error ? err.message : 'Failed to update kills. Please try again.');
+      setTimeout(() => setConflictError(null), 5000);
       loadParty();
     } finally {
       pendingKillUpdateRef.current = false;

@@ -270,7 +270,14 @@ func (p *Planner) GeneratePlanFiltered(ctx context.Context, weekNumber, year int
 		// Sort tasks by key holder so each player uses all their keys contiguously
 		// This minimizes the number of times the party leader needs to swap key providers
 		sort.Slice(party.Tasks, func(i, j int) bool {
-			// NoKeys tasks go last
+			// Kronos always goes last
+			if party.Tasks[i].BossName == "kronos" {
+				return false
+			}
+			if party.Tasks[j].BossName == "kronos" {
+				return true
+			}
+			// NoKeys tasks go last (but before kronos)
 			if party.Tasks[i].NoKeys != party.Tasks[j].NoKeys {
 				return !party.Tasks[i].NoKeys
 			}

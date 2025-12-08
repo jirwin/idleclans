@@ -117,3 +117,11 @@ export interface PartySession {
   created_at: string;
 }
 
+export interface PartySummary {
+  id: string;
+  players: string[];
+  started_at: string | null;
+  ended_at: string | null;
+  created_at: string;
+}
+
