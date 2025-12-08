@@ -17,7 +17,6 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 
-	"github.com/jirwin/idleclans/pkg/ollama"
 	"github.com/jirwin/idleclans/pkg/quests"
 	"go.uber.org/zap"
 )
@@ -1346,16 +1345,28 @@ type llmKeyResponse struct {
 }
 
 const questAnalysisPrompt = `You are analyzing a screenshot from the game IdleClans showing a quest tracker.
-The quest tracker shows boss names and the number of kills required for each boss.
+
+Each quest entry has this format:
+- Quest title (e.g., "The godslayer")
+- Boss target line: "Kill [BossName]" (e.g., "Kill Chimera", "Kill Zeus")
+- Progress bar showing: "Completions: [current]/[required] | [percentage]%"
+
+IMPORTANT: Extract the REQUIRED KILLS number - this is the number AFTER the slash.
+For example: "Completions: 0/52 | 0%" means 52 required kills.
 
 Valid boss names are: griffin, medusa, hades, zeus, devil, chimera, dragon, sobek, kronos
 
-Extract the boss names and their required kill counts from the image.
-Return ONLY a JSON object in this exact format, with no other text:
-{"bosses": [{"name": "boss_name_lowercase", "kills": number}, ...]}
+For each quest visible, extract:
+1. The boss name from the "Kill [BossName]" line
+2. The required kills (number after the slash in the completions line)
 
-Only include bosses that are visible in the screenshot with a kill requirement greater than 0.
-Use lowercase for boss names exactly as listed above.`
+Return ONLY a JSON object:
+{"bosses": [{"name": "chimera", "kills": 52}, {"name": "kronos", "kills": 6}]}
+
+Rules:
+- Use lowercase boss names exactly as listed above
+- Only include quests with required kills > 0
+- The "kills" value is the TOTAL required, not current progress`
 
 // keyDescribePrompt asks the model to describe each key tile
 const keyDescribePrompt = `Look at this game inventory showing boss keys in a row.
@@ -1373,11 +1384,28 @@ Key 2: [COLOR] [SHAPE], number: [NUMBER]
 Be thorough - describe EVERY key tile you can see, from left to right.`
 
 // keyAnalysisPrompt is a simple single-pass prompt (used by authenticated endpoint)
-const keyAnalysisPrompt = `Analyze this key inventory screenshot. Return JSON with keys that have visible orange numbers.
+const keyAnalysisPrompt = `Analyze this inventory screenshot from IdleClans. Find all KEYS and the KRONOS BOOK.
 
-KEY COLORS: mountain=BROWN, godly=GOLD, burning=RED, underworld=DARK_BLUE, mutated=GREEN, stone=GRAY, ancient=WHITE, otherworldly=CYAN
+ONLY include items that:
+1. Look like a KEY (has a key shape with a handle and teeth/blade) OR is the Kronos book (red/brown book with spots)
+2. Have a visible orange number on them
 
-OUTPUT: {"keys":[{"type":"godly","count":19}]}`
+IGNORE anything that doesn't look like a key or the Kronos book - even if it has a number.
+
+KEY COLORS:
+- Brown/tan/orange key = "mountain"
+- Gold/yellow key = "godly"
+- Red key = "burning"
+- Dark blue key = "underworld"
+- Green key = "mutated"
+- Gray/silver key = "stone"
+- White key = "ancient"
+- Cyan/light blue key = "otherworldly"
+- Red/brown book with spots = "kronos"
+
+Numbers with K suffix: 71.8K = 71800
+
+Return JSON: {"keys":[{"type":"mountain","count":71800},{"type":"godly","count":39}]}`
 
 // keyParsePrompt converts the description to JSON
 const keyParsePrompt = `Convert this key description to JSON.
@@ -1435,7 +1463,7 @@ func (s *Server) handleAnalyzeQuests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.ollamaClient == nil {
+	if s.openaiClient == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		json.NewEncoder(w).Encode(AnalyzeQuestsResponse{Error: "Image analysis not configured"})
@@ -1478,13 +1506,13 @@ func (s *Server) handleAnalyzeQuests(w http.ResponseWriter, r *http.Request) {
 	// Encode to base64
 	imageBase64 := base64.StdEncoding.EncodeToString(imageData)
 
-	// Call LLM
-	resp, err := s.ollamaClient.ChatCompletionWithImage(
-		s.config.OllamaModel,
+	// Call OpenAI with JSON mode
+	resp, err := s.openaiClient.ChatCompletionWithImageJSON(
 		questAnalysisPrompt,
 		"Please analyze this quest tracker screenshot and extract the boss kill requirements.",
 		imageBase64,
 		imageType,
+		true, // Force JSON output
 	)
 	if err != nil {
 		s.logger.Error("Failed to analyze quest screenshot", zap.Error(err))
@@ -1584,7 +1612,7 @@ func (s *Server) handleAnalyzeKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.ollamaClient == nil {
+	if s.openaiClient == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Image analysis not configured"})
@@ -1627,13 +1655,13 @@ func (s *Server) handleAnalyzeKeys(w http.ResponseWriter, r *http.Request) {
 	// Encode to base64
 	imageBase64 := base64.StdEncoding.EncodeToString(imageData)
 
-	// Call LLM
-	resp, err := s.ollamaClient.ChatCompletionWithImage(
-		s.config.OllamaModel,
+	// Call OpenAI with JSON mode
+	resp, err := s.openaiClient.ChatCompletionWithImageJSON(
 		keyAnalysisPrompt,
 		"Please analyze this key inventory screenshot and extract the key counts.",
 		imageBase64,
 		imageType,
+		true, // Force JSON output
 	)
 	if err != nil {
 		s.logger.Error("Failed to analyze key screenshot", zap.Error(err))
@@ -1857,7 +1885,7 @@ func parseKeyResponseFallback(content string) *singleKeyResponse {
 // handleAdminAnalyzeQuests is the admin version that doesn't require authentication
 func (s *Server) handleAdminAnalyzeQuests(w http.ResponseWriter, r *http.Request) {
 	// Same logic as handleAnalyzeQuests but without auth check
-	if s.ollamaClient == nil {
+	if s.openaiClient == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		json.NewEncoder(w).Encode(AnalyzeQuestsResponse{Error: "Image analysis not configured"})
@@ -1900,13 +1928,13 @@ func (s *Server) handleAdminAnalyzeQuests(w http.ResponseWriter, r *http.Request
 	// Encode to base64
 	imageBase64 := base64.StdEncoding.EncodeToString(imageData)
 
-	// Call LLM
-	resp, err := s.ollamaClient.ChatCompletionWithImage(
-		s.config.OllamaModel,
+	// Call OpenAI with JSON mode
+	resp, err := s.openaiClient.ChatCompletionWithImageJSON(
 		questAnalysisPrompt,
 		"Please analyze this quest tracker screenshot and extract the boss kill requirements.",
 		imageBase64,
 		imageType,
+		true, // Force JSON output
 	)
 	if err != nil {
 		s.logger.Error("Failed to analyze quest screenshot", zap.Error(err))
@@ -1952,9 +1980,9 @@ func (s *Server) handleAdminAnalyzeQuests(w http.ResponseWriter, r *http.Request
 }
 
 // handleAdminAnalyzeKeys is the admin version that doesn't require authentication
-// It analyzes the full image in a single pass
+// It analyzes the full image in a single pass using OpenAI
 func (s *Server) handleAdminAnalyzeKeys(w http.ResponseWriter, r *http.Request) {
-	if s.ollamaClient == nil {
+	if s.openaiClient == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Image analysis not configured"})
@@ -1970,7 +1998,7 @@ func (s *Server) handleAdminAnalyzeKeys(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Get the image file
-	file, _, err := r.FormFile("image")
+	file, header, err := r.FormFile("image")
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
@@ -2000,55 +2028,38 @@ func (s *Server) handleAdminAnalyzeKeys(w http.ResponseWriter, r *http.Request) 
 		zap.Int("img_width", imgWidth),
 		zap.Int("img_height", imgHeight))
 
+	// Determine image type
+	imageType := header.Header.Get("Content-Type")
+	if imageType == "" {
+		imageType = "image/png" // Default to PNG
+	}
+
 	imageBase64 := base64.StdEncoding.EncodeToString(imageData)
 
-	// PASS 1: Ask the model to describe what it sees
-	descResp, err := s.ollamaClient.ChatCompletionWithImage(
-		s.config.OllamaModel,
-		keyDescribePrompt,
-		"Describe each key tile from left to right.",
+	// Single pass with JSON mode using OpenAI
+	resp, err := s.openaiClient.ChatCompletionWithImageJSON(
+		keyAnalysisPrompt,
+		"Please analyze this key inventory screenshot and extract the key counts.",
 		imageBase64,
-		"image/png",
+		imageType,
+		true, // Force JSON output
 	)
 	if err != nil {
-		s.logger.Error("Failed to describe keys", zap.Error(err))
+		s.logger.Error("Failed to analyze keys", zap.Error(err))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Failed to analyze image: " + err.Error()})
 		return
 	}
 
-	description := descResp.Choices[0].Message.Content
-	s.logger.Info("Pass 1 - Key description", zap.String("description", description))
-
-	// PASS 2: Parse the description into JSON using a text-only call
-	parseMessages := []ollama.ChatMessage{
-		{Role: "system", Content: keyParsePrompt},
-		{Role: "user", Content: "Here is the key description:\n\n" + description + "\n\nConvert this to JSON format."},
-	}
-
-	parseResp, err := s.ollamaClient.ChatCompletion(parseMessages)
-	if err != nil {
-		s.logger.Error("Failed to parse description", zap.Error(err))
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Failed to parse description: " + err.Error()})
-		return
-	}
-
-	rawContent := parseResp.Choices[0].Message.Content
-	content := cleanKeyJSON(rawContent)
-
-	s.logger.Info("Pass 2 - Parsed JSON",
-		zap.String("raw", rawContent),
-		zap.String("cleaned", content))
+	content := extractJSON(resp.Choices[0].Message.Content)
+	s.logger.Info("Key analysis response", zap.String("content", content))
 
 	var llmResp llmKeyResponse
 	if err := json.Unmarshal([]byte(content), &llmResp); err != nil {
 		s.logger.Error("Failed to parse JSON response",
 			zap.Error(err),
-			zap.String("raw", rawContent),
-			zap.String("cleaned", content))
+			zap.String("content", resp.Choices[0].Message.Content))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(AnalyzeKeysResponse{Error: "Failed to parse analysis result"})
@@ -2087,8 +2098,7 @@ func (s *Server) analyzeKeyTiles(tiles [][]byte, splitInfo *ImageSplitInfo) []Ke
 	for i, tileData := range tiles {
 		tileBase64 := base64.StdEncoding.EncodeToString(tileData)
 
-		resp, err := s.ollamaClient.ChatCompletionWithImageJSON(
-			s.config.OllamaModel,
+		resp, err := s.openaiClient.ChatCompletionWithImageJSON(
 			singleKeyAnalysisPrompt,
 			"Identify the key type and count.",
 			tileBase64,

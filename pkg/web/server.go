@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/jirwin/idleclans/pkg/idleclans"
-	"github.com/jirwin/idleclans/pkg/ollama"
+	"github.com/jirwin/idleclans/pkg/openai"
 	"github.com/jirwin/idleclans/pkg/quests"
 	"go.uber.org/zap"
 )
@@ -22,9 +22,8 @@ type Config struct {
 	SessionSecret       string
 	RequiredGuild       string // Guild name required for registration
 	DiscordChannelID    string // Channel to send messages to
-	OllamaHost          string // Ollama API host (e.g., http://mother:11434)
-	OllamaModel         string // Vision model for image analysis (e.g., llava)
-	OllamaAPIKey        string // API key for Ollama (optional)
+	OpenAIAPIKey        string // OpenAI API key for image analysis
+	OpenAIModel         string // Vision model for image analysis (e.g., gpt-4o)
 }
 
 // DiscordEmbed represents a Discord embed for the web server
@@ -59,7 +58,7 @@ type Server struct {
 	sseBroker     *SSEBroker
 	icClient      *idleclans.Client
 	discordSender DiscordMessageSender
-	ollamaClient  *ollama.Client
+	openaiClient  *openai.Client
 }
 
 // SetDiscordSender sets the Discord message sender
@@ -82,12 +81,14 @@ func NewServer(config *Config, db *quests.DB, logger *zap.Logger) (*Server, erro
 		icClient:     idleclans.New(),
 	}
 
-	// Initialize Ollama client if configured
-	if config.OllamaHost != "" {
-		s.ollamaClient = ollama.NewClient(config.OllamaHost, config.OllamaModel, config.OllamaAPIKey)
-		logger.Info("Ollama client initialized",
-			zap.String("host", config.OllamaHost),
-			zap.String("model", config.OllamaModel))
+	// Initialize OpenAI client if configured
+	if config.OpenAIAPIKey != "" {
+		model := config.OpenAIModel
+		if model == "" {
+			model = "gpt-4o" // Default to GPT-4o for vision
+		}
+		s.openaiClient = openai.NewClient(config.OpenAIAPIKey, model)
+		logger.Info("OpenAI client initialized", zap.String("model", model))
 	}
 
 	return s, nil

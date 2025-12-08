@@ -142,9 +142,8 @@ func main() {
 			SessionSecret:       getCredential("session_secret", "SESSION_SECRET"),
 			RequiredGuild:       os.Getenv("REQUIRED_GUILD"),
 			DiscordChannelID:    os.Getenv("DISCORD_CHANNEL_ID"),
-			OllamaHost:          getEnvString("OLLAMA_HOST", "http://mother:11434"),
-			OllamaModel:         getEnvString("OLLAMA_MODEL", "qwen:110b"),
-			OllamaAPIKey:        getEnvString("OLLAMA_API_KEY", "ollama"),
+			OpenAIAPIKey:        getCredential("openai_api_key", "OPENAI_API_KEY"),
+			OpenAIModel:         getEnvString("OPENAI_MODEL", "gpt-4o"),
 		}
 
 		if webConfig.BaseURL == "" {
