@@ -42,9 +42,9 @@ type PlayerData struct {
 	Keys       map[string]int `json:"keys"`
 }
 
-// getWeekAndYear returns the current ISO week number and year
+// getWeekAndYear returns the current ISO week number and year (based on UTC)
 func getWeekAndYear() (int, int) {
-	now := time.Now()
+	now := time.Now().UTC()
 	year, week := now.ISOWeek()
 	return week, year
 }
