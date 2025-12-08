@@ -1,12 +1,22 @@
-import { useEffect, useState, useCallback, useMemo } from 'react';
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { UserData } from '../types';
 import { KEY_TYPES, BOSSES } from '../types';
-import { fetchUserData, updateQuest, updateKeys, logout } from '../api';
+import {
+  fetchUserData,
+  updateQuest,
+  updateKeys,
+  logout,
+  analyzeQuestsScreenshot,
+  analyzeKeysScreenshot,
+  type AnalyzedBoss,
+  type AnalyzedKey,
+} from '../api';
 import { QuestCard } from '../components/QuestCard';
 import { KeysCard } from '../components/KeysCard';
 import { AltsManager } from '../components/AltsManager';
 import { Registration } from '../components/Registration';
+import { ScreenshotAnalysisModal } from '../components/ScreenshotAnalysisModal';
 import { useSSE } from '../hooks/useSSE';
 
 export function Dashboard() {
@@ -18,6 +28,21 @@ export function Dashboard() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [selectedCharacter, setSelectedCharacter] = useState<string>('');
   const [showCharacterMenu, setShowCharacterMenu] = useState(false);
+  
+  // Screenshot upload state
+  const [uploadingScreenshot, setUploadingScreenshot] = useState<'quests' | 'keys' | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [screenshotModal, setScreenshotModal] = useState<{
+    type: 'quests' | 'keys';
+    image: string;
+    questResults?: AnalyzedBoss[];
+    keyResults?: AnalyzedKey[];
+  } | null>(null);
+  const [pasteTarget, setPasteTarget] = useState<'quests' | 'keys' | null>(null);
+  
+  // File input refs
+  const questFileInputRef = useRef<HTMLInputElement>(null);
+  const keyFileInputRef = useRef<HTMLInputElement>(null);
 
   const loadData = useCallback(async (showRefreshIndicator = false) => {
     if (showRefreshIndicator) {
@@ -85,6 +110,82 @@ export function Dashboard() {
     navigate('/');
   };
 
+  // Screenshot upload handlers
+  const handleScreenshotUpload = async (file: File, type: 'quests' | 'keys') => {
+    setUploadingScreenshot(type);
+    setUploadError(null);
+
+    try {
+      // Create preview
+      const reader = new FileReader();
+      const imagePreview = await new Promise<string>((resolve) => {
+        reader.onload = (e) => resolve(e.target?.result as string);
+        reader.readAsDataURL(file);
+      });
+
+      // Analyze screenshot
+      if (type === 'quests') {
+        const result = await analyzeQuestsScreenshot(file);
+        if (result.error) {
+          setUploadError(result.error);
+        } else {
+          setScreenshotModal({
+            type: 'quests',
+            image: imagePreview,
+            questResults: result.bosses,
+          });
+        }
+      } else {
+        const result = await analyzeKeysScreenshot(file);
+        if (result.error) {
+          setUploadError(result.error);
+        } else {
+          setScreenshotModal({
+            type: 'keys',
+            image: imagePreview,
+            keyResults: result.keys,
+          });
+        }
+      }
+    } catch (err) {
+      setUploadError(err instanceof Error ? err.message : 'Failed to analyze screenshot');
+    } finally {
+      setUploadingScreenshot(null);
+    }
+  };
+
+  const handleQuestFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      handleScreenshotUpload(file, 'quests');
+    }
+    // Reset input so same file can be selected again
+    e.target.value = '';
+  };
+
+  const handleKeyFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      handleScreenshotUpload(file, 'keys');
+    }
+    // Reset input so same file can be selected again
+    e.target.value = '';
+  };
+
+  const handleApplyQuestChanges = async (updates: Array<{ boss: string; kills: number }>) => {
+    for (const update of updates) {
+      await updateQuest(selectedCharacter, update.boss, update.kills);
+    }
+    await loadData();
+  };
+
+  const handleApplyKeyChanges = async (updates: Array<{ keyType: string; count: number }>) => {
+    for (const update of updates) {
+      await updateKeys(selectedCharacter, update.keyType, update.count);
+    }
+    await loadData();
+  };
+
   // Get all character names
   const allPlayerNames = userData ? [userData.player_name, ...userData.alts].filter(Boolean) : [];
   
@@ -134,14 +235,42 @@ export function Dashboard() {
     return { totalQuestsRemaining, totalBossesWithQuests, keyTotals, totalKeys, keysRequired, totalKeysRequired };
   }, [userData, selectedCharacter]);
 
-  // Close menu when clicking outside
+  // Close menus when clicking outside
   useEffect(() => {
-    const handleClickOutside = () => setShowCharacterMenu(false);
+    const handleClickOutside = () => {
+      setShowCharacterMenu(false);
+      setPasteTarget(null);
+    };
     if (showCharacterMenu) {
       document.addEventListener('click', handleClickOutside);
       return () => document.removeEventListener('click', handleClickOutside);
     }
   }, [showCharacterMenu]);
+
+  // Global paste handler for screenshots
+  useEffect(() => {
+    const handlePaste = (e: ClipboardEvent) => {
+      if (!pasteTarget) return;
+      
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      for (const item of items) {
+        if (item.type.startsWith('image/')) {
+          const file = item.getAsFile();
+          if (file) {
+            e.preventDefault();
+            handleScreenshotUpload(file, pasteTarget);
+            setPasteTarget(null);
+          }
+          break;
+        }
+      }
+    };
+
+    document.addEventListener('paste', handlePaste);
+    return () => document.removeEventListener('paste', handlePaste);
+  }, [pasteTarget]);
 
   if (loading) {
     return (
@@ -210,6 +339,22 @@ export function Dashboard() {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {/* Hidden file inputs for screenshot uploads */}
+            <input
+              ref={questFileInputRef}
+              type="file"
+              accept="image/*"
+              onChange={handleQuestFileChange}
+              className="hidden"
+            />
+            <input
+              ref={keyFileInputRef}
+              type="file"
+              accept="image/*"
+              onChange={handleKeyFileChange}
+              className="hidden"
+            />
+            
             <button
               onClick={() => navigate('/clan')}
               className="p-2 text-white bg-gradient-to-r from-violet-600 to-purple-600 hover:from-violet-500 hover:to-purple-500 rounded-lg transition-all"
@@ -395,18 +540,112 @@ export function Dashboard() {
 
         {/* Quests and Keys for Selected Character */}
         <div className="grid gap-4 lg:grid-cols-2">
-          <QuestCard
-            playerName={selectedCharacter}
-            quests={userData.quests[selectedCharacter] || []}
-            onUpdateQuest={handleUpdateQuest}
-          />
+          {/* Quest Card with Screenshot Upload */}
+          <div className="space-y-2">
+            {/* Screenshot Upload Bar for Quests */}
+            <div 
+              className={`flex items-center justify-between px-3 py-2 rounded-lg border transition-all cursor-pointer ${
+                pasteTarget === 'quests'
+                  ? 'bg-violet-900/30 border-violet-500'
+                  : 'bg-[var(--color-bg-card)] border-[var(--color-border)] hover:border-violet-500/50'
+              }`}
+              onClick={() => setPasteTarget(pasteTarget === 'quests' ? null : 'quests')}
+            >
+              <div className="flex items-center gap-2">
+                <svg className="w-4 h-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
+                <span className="text-sm text-gray-300">
+                  {pasteTarget === 'quests' ? (
+                    <span className="text-violet-300">Press Ctrl+V to paste quest screenshot</span>
+                  ) : (
+                    'Upload quest screenshot'
+                  )}
+                </span>
+              </div>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  questFileInputRef.current?.click();
+                }}
+                disabled={uploadingScreenshot === 'quests'}
+                className="px-2 py-1 text-xs bg-violet-600 hover:bg-violet-700 text-white rounded transition-colors disabled:opacity-50 flex items-center gap-1"
+              >
+                {uploadingScreenshot === 'quests' ? (
+                  <>
+                    <div className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                    Analyzing...
+                  </>
+                ) : (
+                  'Browse'
+                )}
+              </button>
+            </div>
+            
+            {uploadError && uploadingScreenshot === null && (
+              <div className="px-3 py-2 bg-red-900/20 border border-red-700/50 rounded-lg">
+                <p className="text-xs text-red-400">{uploadError}</p>
+              </div>
+            )}
+            
+            <QuestCard
+              playerName={selectedCharacter}
+              quests={userData.quests[selectedCharacter] || []}
+              onUpdateQuest={handleUpdateQuest}
+            />
+          </div>
           
           <div className="space-y-4">
-            <KeysCard
-              playerName={selectedCharacter}
-              keys={userData.keys[selectedCharacter] || {}}
-              onUpdateKeys={handleUpdateKeys}
-            />
+            {/* Key Card with Screenshot Upload */}
+            <div className="space-y-2">
+              {/* Screenshot Upload Bar for Keys */}
+              <div 
+                className={`flex items-center justify-between px-3 py-2 rounded-lg border transition-all cursor-pointer ${
+                  pasteTarget === 'keys'
+                    ? 'bg-emerald-900/30 border-emerald-500'
+                    : 'bg-[var(--color-bg-card)] border-[var(--color-border)] hover:border-emerald-500/50'
+                }`}
+                onClick={() => setPasteTarget(pasteTarget === 'keys' ? null : 'keys')}
+              >
+                <div className="flex items-center gap-2">
+                  <svg className="w-4 h-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+                  </svg>
+                  <span className="text-sm text-gray-300">
+                    {pasteTarget === 'keys' ? (
+                      <span className="text-emerald-300">Press Ctrl+V to paste key screenshot</span>
+                    ) : (
+                      'Upload key screenshot'
+                    )}
+                  </span>
+                </div>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    keyFileInputRef.current?.click();
+                  }}
+                  disabled={uploadingScreenshot === 'keys'}
+                  className="px-2 py-1 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded transition-colors disabled:opacity-50 flex items-center gap-1"
+                >
+                  {uploadingScreenshot === 'keys' ? (
+                    <>
+                      <div className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      Analyzing...
+                    </>
+                  ) : (
+                    'Browse'
+                  )}
+                </button>
+              </div>
+              
+              <KeysCard
+                playerName={selectedCharacter}
+                keys={userData.keys[selectedCharacter] || {}}
+                onUpdateKeys={handleUpdateKeys}
+              />
+            </div>
             
             {/* Alts Manager */}
             <AltsManager
@@ -416,6 +655,31 @@ export function Dashboard() {
           </div>
         </div>
       </div>
+
+      {/* Screenshot Analysis Modal */}
+      {screenshotModal && screenshotModal.type === 'quests' && screenshotModal.questResults && (
+        <ScreenshotAnalysisModal
+          type="quests"
+          imagePreview={screenshotModal.image}
+          analysisResults={screenshotModal.questResults}
+          currentData={userData.quests[selectedCharacter] || []}
+          playerName={selectedCharacter}
+          onApply={handleApplyQuestChanges}
+          onClose={() => setScreenshotModal(null)}
+        />
+      )}
+      
+      {screenshotModal && screenshotModal.type === 'keys' && screenshotModal.keyResults && (
+        <ScreenshotAnalysisModal
+          type="keys"
+          imagePreview={screenshotModal.image}
+          analysisResults={screenshotModal.keyResults}
+          currentData={userData.keys[selectedCharacter] || {}}
+          playerName={selectedCharacter}
+          onApply={handleApplyKeyChanges}
+          onClose={() => setScreenshotModal(null)}
+        />
+      )}
     </div>
   );
 }

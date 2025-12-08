@@ -283,3 +283,81 @@ export async function adminDeletePlayer(discordId: string): Promise<void> {
   }
 }
 
+// Screenshot analysis API functions
+
+export interface AnalyzedBoss {
+  name: string;
+  kills: number;
+}
+
+export interface AnalyzeQuestsResponse {
+  bosses: AnalyzedBoss[];
+  applied: boolean;
+  error?: string;
+}
+
+export interface AnalyzedKey {
+  type: string;
+  count: number;
+}
+
+export interface AnalyzeKeysResponse {
+  keys: AnalyzedKey[];
+  applied: boolean;
+  error?: string;
+}
+
+export async function analyzeQuestsScreenshot(image: File): Promise<AnalyzeQuestsResponse> {
+  const formData = new FormData();
+  formData.append('image', image);
+
+  const res = await fetch(`${API_BASE}/analyze/quests`, {
+    method: 'POST',
+    credentials: 'include',
+    body: formData,
+  });
+
+  if (res.status === 401) {
+    throw new Error('Unauthorized');
+  }
+
+  if (res.status === 503) {
+    throw new Error('Image analysis not configured');
+  }
+
+  const data = await res.json();
+  
+  if (!res.ok) {
+    throw new Error(data.error || `Failed to analyze screenshot: ${res.statusText}`);
+  }
+
+  return data;
+}
+
+export async function analyzeKeysScreenshot(image: File): Promise<AnalyzeKeysResponse> {
+  const formData = new FormData();
+  formData.append('image', image);
+
+  const res = await fetch(`${API_BASE}/analyze/keys`, {
+    method: 'POST',
+    credentials: 'include',
+    body: formData,
+  });
+
+  if (res.status === 401) {
+    throw new Error('Unauthorized');
+  }
+
+  if (res.status === 503) {
+    throw new Error('Image analysis not configured');
+  }
+
+  const data = await res.json();
+  
+  if (!res.ok) {
+    throw new Error(data.error || `Failed to analyze screenshot: ${res.statusText}`);
+  }
+
+  return data;
+}
+

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 
 interface BossResult {
   name: string;
@@ -22,6 +22,8 @@ interface AnalyzeKeysResponse {
   error?: string;
 }
 
+type PasteTarget = 'quest' | 'keys' | null;
+
 export function ScreenshotAnalyzer() {
   const [questFile, setQuestFile] = useState<File | null>(null);
   const [keyFile, setKeyFile] = useState<File | null>(null);
@@ -31,36 +33,72 @@ export function ScreenshotAnalyzer() {
   const [keyResult, setKeyResult] = useState<AnalyzeKeysResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pasteTarget, setPasteTarget] = useState<PasteTarget>(null);
+
+  // Handle image from clipboard or file
+  const handleQuestImage = useCallback((file: File) => {
+    setQuestFile(file);
+    setQuestResult(null);
+    setError(null);
+    
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      setQuestPreview(e.target?.result as string);
+    };
+    reader.readAsDataURL(file);
+  }, []);
+
+  const handleKeyImage = useCallback((file: File) => {
+    setKeyFile(file);
+    setKeyResult(null);
+    setError(null);
+    
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      setKeyPreview(e.target?.result as string);
+    };
+    reader.readAsDataURL(file);
+  }, []);
+
+  // Global paste handler
+  useEffect(() => {
+    const handlePaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      for (const item of items) {
+        if (item.type.startsWith('image/')) {
+          const file = item.getAsFile();
+          if (file) {
+            e.preventDefault();
+            
+            // Route to the appropriate handler based on paste target
+            if (pasteTarget === 'quest') {
+              handleQuestImage(file);
+            } else if (pasteTarget === 'keys') {
+              handleKeyImage(file);
+            }
+          }
+          break;
+        }
+      }
+    };
+
+    document.addEventListener('paste', handlePaste);
+    return () => document.removeEventListener('paste', handlePaste);
+  }, [pasteTarget, handleQuestImage, handleKeyImage]);
 
   const handleQuestFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      setQuestFile(file);
-      setQuestResult(null);
-      setError(null);
-      
-      // Create preview
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        setQuestPreview(e.target?.result as string);
-      };
-      reader.readAsDataURL(file);
+      handleQuestImage(file);
     }
   };
 
   const handleKeyFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      setKeyFile(file);
-      setKeyResult(null);
-      setError(null);
-      
-      // Create preview
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        setKeyPreview(e.target?.result as string);
-      };
-      reader.readAsDataURL(file);
+      handleKeyImage(file);
     }
   };
 
@@ -146,6 +184,12 @@ export function ScreenshotAnalyzer() {
           </p>
         </div>
 
+        <div className="mb-4 p-3 bg-violet-900/20 border border-violet-700/50 rounded-lg">
+          <p className="text-sm text-violet-300">
+            <span className="font-medium">💡 Tip:</span> Click a paste zone below, then press <kbd className="px-1.5 py-0.5 bg-violet-800/50 rounded text-xs">Ctrl+V</kbd> to paste an image from your clipboard.
+          </p>
+        </div>
+
         {error && (
           <div className="mb-4 p-3 bg-red-900/20 border border-red-700/50 rounded-lg">
             <p className="text-sm text-red-300">{error}</p>
@@ -155,14 +199,28 @@ export function ScreenshotAnalyzer() {
 
       <div className="grid gap-6 md:grid-cols-2">
         {/* Quest Analyzer */}
-        <div className="bg-[var(--color-bg-card)] rounded-xl border border-[var(--color-border)] p-4">
-          <h3 className="font-semibold text-white mb-4">Quest Tracker</h3>
+        <div 
+          className={`bg-[var(--color-bg-card)] rounded-xl border-2 p-4 cursor-pointer transition-all ${
+            pasteTarget === 'quest' 
+              ? 'border-violet-500 ring-2 ring-violet-500/30' 
+              : 'border-[var(--color-border)] hover:border-violet-500/50'
+          }`}
+          onClick={() => setPasteTarget('quest')}
+        >
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="font-semibold text-white">Quest Tracker</h3>
+            {pasteTarget === 'quest' && (
+              <span className="text-xs px-2 py-1 bg-violet-600 text-white rounded animate-pulse">
+                📋 Ready to paste
+              </span>
+            )}
+          </div>
           
           <div className="space-y-4">
             <div>
-              <label className="block text-sm text-gray-300 mb-2">Upload Quest Screenshot</label>
+              <label className="block text-sm text-gray-300 mb-2">Upload or paste Quest Screenshot</label>
               <div className="flex items-center gap-2">
-                <label className="flex-1 cursor-pointer">
+                <label className="flex-1 cursor-pointer" onClick={(e) => e.stopPropagation()}>
                   <input
                     type="file"
                     accept="image/*"
@@ -241,21 +299,35 @@ export function ScreenshotAnalyzer() {
         </div>
 
         {/* Key Analyzer */}
-        <div className="bg-[var(--color-bg-card)] rounded-xl border border-[var(--color-border)] p-4">
-          <h3 className="font-semibold text-white mb-4">Key Inventory</h3>
+        <div 
+          className={`bg-[var(--color-bg-card)] rounded-xl border-2 p-4 cursor-pointer transition-all ${
+            pasteTarget === 'keys' 
+              ? 'border-emerald-500 ring-2 ring-emerald-500/30' 
+              : 'border-[var(--color-border)] hover:border-emerald-500/50'
+          }`}
+          onClick={() => setPasteTarget('keys')}
+        >
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="font-semibold text-white">Key Inventory</h3>
+            {pasteTarget === 'keys' && (
+              <span className="text-xs px-2 py-1 bg-emerald-600 text-white rounded animate-pulse">
+                📋 Ready to paste
+              </span>
+            )}
+          </div>
           
           <div className="space-y-4">
             <div>
-              <label className="block text-sm text-gray-300 mb-2">Upload Key Screenshot</label>
+              <label className="block text-sm text-gray-300 mb-2">Upload or paste Key Screenshot</label>
               <div className="flex items-center gap-2">
-                <label className="flex-1 cursor-pointer">
+                <label className="flex-1 cursor-pointer" onClick={(e) => e.stopPropagation()}>
                   <input
                     type="file"
                     accept="image/*"
                     onChange={handleKeyFileChange}
                     className="hidden"
                   />
-                  <div className="px-4 py-2 bg-[var(--color-bg-input)] border border-[var(--color-border)] rounded-lg hover:border-violet-500 transition-colors flex items-center justify-center gap-2">
+                  <div className="px-4 py-2 bg-[var(--color-bg-input)] border border-[var(--color-border)] rounded-lg hover:border-emerald-500 transition-colors flex items-center justify-center gap-2">
                     <span className="text-sm">📤</span>
                     <span className="text-sm text-gray-300">
                       {keyFile ? keyFile.name : 'Choose file...'}
