@@ -168,12 +168,12 @@ export async function fetchClanPlayers(): Promise<string[]> {
   return data.players || [];
 }
 
-export async function sendPlanToDiscord(players: string[]): Promise<void> {
+export async function sendPlanToDiscord(players: string[], noPing: boolean = false): Promise<void> {
   const res = await fetch(`${API_BASE}/clan/plan/send`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
-    body: JSON.stringify({ players }),
+    body: JSON.stringify({ players, no_ping: noPing }),
   });
   
   if (res.status === 401) {

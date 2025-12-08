@@ -267,6 +267,21 @@ func (p *Planner) GeneratePlanFiltered(ctx context.Context, weekNumber, year int
 			}
 		}
 
+		// Sort tasks by key holder so each player uses all their keys contiguously
+		// This minimizes the number of times the party leader needs to swap key providers
+		sort.Slice(party.Tasks, func(i, j int) bool {
+			// NoKeys tasks go last
+			if party.Tasks[i].NoKeys != party.Tasks[j].NoKeys {
+				return !party.Tasks[i].NoKeys
+			}
+			// Sort by key holder name
+			if party.Tasks[i].KeyHolder != party.Tasks[j].KeyHolder {
+				return party.Tasks[i].KeyHolder < party.Tasks[j].KeyHolder
+			}
+			// Within same key holder, sort by boss name for consistency
+			return party.Tasks[i].BossName < party.Tasks[j].BossName
+		})
+
 		// Add party to plan (always, even if no keys)
 		if len(party.Tasks) > 0 {
 			parties = append(parties, party)

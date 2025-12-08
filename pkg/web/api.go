@@ -1018,6 +1018,7 @@ func (s *Server) handleGetClanPlan(w http.ResponseWriter, r *http.Request) {
 // SendPlanRequest represents a request to send a plan to Discord
 type SendPlanRequest struct {
 	Players []string `json:"players"` // Player names to include in the plan
+	NoPing  bool     `json:"no_ping"` // If true, don't ping users
 }
 
 // handleSendPlanToDiscord sends a plan message to Discord as an embed
@@ -1055,25 +1056,27 @@ func (s *Server) handleSendPlanToDiscord(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Collect unique Discord user IDs for pinging
-	playerDiscordIDs := make(map[string]string)
-	for _, playerName := range req.Players {
-		discordID, err := s.db.GetDiscordUserIDForPlayer(ctx, playerName)
-		if err == nil && discordID != "" {
-			playerDiscordIDs[playerName] = discordID
+	// Build ping string (unique users only) - skip if NoPing is set
+	var pingContent string
+	if !req.NoPing {
+		playerDiscordIDs := make(map[string]string)
+		for _, playerName := range req.Players {
+			discordID, err := s.db.GetDiscordUserIDForPlayer(ctx, playerName)
+			if err == nil && discordID != "" {
+				playerDiscordIDs[playerName] = discordID
+			}
 		}
-	}
 
-	// Build ping string (unique users only)
-	seenIDs := make(map[string]bool)
-	var pings []string
-	for _, discordID := range playerDiscordIDs {
-		if !seenIDs[discordID] {
-			seenIDs[discordID] = true
-			pings = append(pings, fmt.Sprintf("<@%s>", discordID))
+		seenIDs := make(map[string]bool)
+		var pings []string
+		for _, discordID := range playerDiscordIDs {
+			if !seenIDs[discordID] {
+				seenIDs[discordID] = true
+				pings = append(pings, fmt.Sprintf("<@%s>", discordID))
+			}
 		}
+		pingContent = strings.Join(pings, " ")
 	}
-	pingContent := strings.Join(pings, " ")
 
 	// Build embed fields - only tasks with keys
 	var fields []DiscordEmbedField

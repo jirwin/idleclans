@@ -99,12 +99,12 @@ export function Clan() {
     setPlanData(null);
   };
 
-  const handleSendToDiscord = async () => {
+  const handleSendToDiscord = async (noPing: boolean = false) => {
     if (selectedPlayers.size === 0) return;
     setSending(true);
     setSendError(null);
     try {
-      await sendPlanToDiscord(Array.from(selectedPlayers));
+      await sendPlanToDiscord(Array.from(selectedPlayers), noPing);
       setSent(true);
       setShowSendConfirm(false);
       setTimeout(() => setSent(false), 3000);
@@ -585,7 +585,7 @@ export function Clan() {
               </div>
             )}
 
-            <div className="flex gap-3 justify-end">
+            <div className="flex gap-3 justify-end flex-wrap">
               <button
                 onClick={() => {
                   setShowSendConfirm(false);
@@ -596,7 +596,21 @@ export function Clan() {
                 Cancel
               </button>
               <button
-                onClick={handleSendToDiscord}
+                onClick={() => handleSendToDiscord(true)}
+                disabled={sending}
+                className="px-4 py-2 text-sm font-medium bg-gray-600 hover:bg-gray-500 disabled:bg-gray-700 text-white rounded-lg transition-colors flex items-center gap-2"
+              >
+                {sending ? (
+                  <>
+                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                    Sending...
+                  </>
+                ) : (
+                  <>📤 Send (No Ping)</>
+                )}
+              </button>
+              <button
+                onClick={() => handleSendToDiscord(false)}
                 disabled={sending}
                 className="px-4 py-2 text-sm font-medium bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 text-white rounded-lg transition-colors flex items-center gap-2"
               >
