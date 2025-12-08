@@ -1,4 +1,4 @@
-import type { UserData, PlayerData, ClanBossData, ClanKeysData, PlanData } from './types';
+import type { UserData, PlayerData, ClanBossData, ClanKeysData, PlanData, PartySession } from './types';
 
 const API_BASE = '/api';
 
@@ -359,5 +359,164 @@ export async function analyzeKeysScreenshot(image: File): Promise<AnalyzeKeysRes
   }
 
   return data;
+}
+
+// Party API functions
+
+export async function createParty(players: string[]): Promise<{ id: string }> {
+  const res = await fetch(`${API_BASE}/parties`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ players }),
+  });
+
+  if (res.status === 401) {
+    throw new Error('Unauthorized');
+  }
+
+  if (!res.ok) {
+    throw new Error(`Failed to create party: ${res.statusText}`);
+  }
+
+  return res.json();
+}
+
+export async function getParty(partyId: string): Promise<PartySession> {
+  const res = await fetch(`${API_BASE}/parties/${partyId}`, {
+    credentials: 'include',
+  });
+
+  if (res.status === 401) {
+    throw new Error('Unauthorized');
+  }
+
+  if (res.status === 404) {
+    throw new Error('Party not found');
+  }
+
+  if (res.status === 403) {
+    throw new Error('You do not have access to this party');
+  }
+
+  if (!res.ok) {
+    throw new Error(`Failed to get party: ${res.statusText}`);
+  }
+
+  return res.json();
+}
+
+export async function startPartyStep(partyId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/parties/${partyId}/start`, {
+    method: 'POST',
+    credentials: 'include',
+  });
+
+  if (res.status === 401) {
+    throw new Error('Unauthorized');
+  }
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `Failed to start step: ${res.statusText}`);
+  }
+}
+
+export interface UpdateKillsResult {
+  kills: number;
+  conflict?: boolean;
+  actual_kills?: number;
+}
+
+export async function updatePartyKills(
+  partyId: string,
+  kills: number,
+  delta: boolean = false,
+  expectedKills?: number
+): Promise<UpdateKillsResult> {
+  const body: Record<string, unknown> = { kills, delta };
+  if (expectedKills !== undefined) {
+    body.expected_kills = expectedKills;
+  }
+
+  const res = await fetch(`${API_BASE}/parties/${partyId}/kills`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify(body),
+  });
+
+  if (res.status === 401) {
+    throw new Error('Unauthorized');
+  }
+
+  // Handle conflict (optimistic concurrency failure)
+  if (res.status === 409) {
+    const data = await res.json();
+    return {
+      kills: data.actual_kills,
+      conflict: true,
+      actual_kills: data.actual_kills,
+    };
+  }
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `Failed to update kills: ${res.statusText}`);
+  }
+
+  return res.json();
+}
+
+export async function updatePartyKeys(partyId: string, keysUsed: number): Promise<void> {
+  const res = await fetch(`${API_BASE}/parties/${partyId}/keys`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ keys_used: keysUsed }),
+  });
+
+  if (res.status === 401) {
+    throw new Error('Unauthorized');
+  }
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `Failed to update keys: ${res.statusText}`);
+  }
+}
+
+export async function nextPartyStep(partyId: string): Promise<{ current_step_index: number }> {
+  const res = await fetch(`${API_BASE}/parties/${partyId}/next-step`, {
+    method: 'POST',
+    credentials: 'include',
+  });
+
+  if (res.status === 401) {
+    throw new Error('Unauthorized');
+  }
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `Failed to advance step: ${res.statusText}`);
+  }
+
+  return res.json();
+}
+
+export async function endParty(partyId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/parties/${partyId}/end`, {
+    method: 'POST',
+    credentials: 'include',
+  });
+
+  if (res.status === 401) {
+    throw new Error('Unauthorized');
+  }
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `Failed to end party: ${res.statusText}`);
+  }
 }
 

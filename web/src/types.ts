@@ -95,3 +95,25 @@ export const KEY_TYPES = [
   { type: 'kronos', color: '#4A0080', label: 'Kronos (Book)' },
 ] as const;
 
+// Party session types
+export interface PartyStepProgress {
+  step_index: number;
+  boss_name: string;
+  kills_tracked: number;
+  keys_used: number;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface PartySession {
+  id: string;
+  players: string[];
+  plan: PlanData;
+  current_step_index: number;
+  step_progress: PartyStepProgress[];
+  player_quests: Record<string, Quest[]>;
+  started_at: string | null;
+  ended_at: string | null;
+  created_at: string;
+}
+

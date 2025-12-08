@@ -191,6 +191,15 @@ func (s *Server) setupPublicRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/analyze/quests", s.withAuth(s.handleAnalyzeQuests))
 	mux.HandleFunc("POST /api/analyze/keys", s.withAuth(s.handleAnalyzeKeys))
 
+	// Party routes (authenticated)
+	mux.HandleFunc("POST /api/parties", s.withAuth(s.handleCreateParty))
+	mux.HandleFunc("GET /api/parties/{partyId}", s.withAuth(s.handleGetParty))
+	mux.HandleFunc("POST /api/parties/{partyId}/start", s.withAuth(s.handleStartPartyStep))
+	mux.HandleFunc("PUT /api/parties/{partyId}/kills", s.withAuth(s.handleUpdatePartyKills))
+	mux.HandleFunc("PUT /api/parties/{partyId}/keys", s.withAuth(s.handleUpdatePartyKeys))
+	mux.HandleFunc("POST /api/parties/{partyId}/next-step", s.withAuth(s.handleNextPartyStep))
+	mux.HandleFunc("POST /api/parties/{partyId}/end", s.withAuth(s.handleEndParty))
+
 	// SSE endpoint for live updates
 	mux.HandleFunc("GET /api/events", s.handleSSE)
 

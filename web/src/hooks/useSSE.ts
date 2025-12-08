@@ -8,6 +8,10 @@ interface UseSSEOptions {
 export function useSSE({ onUpdate, enabled = true }: UseSSEOptions) {
   const eventSourceRef = useRef<EventSource | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
+  
+  // Store onUpdate in a ref so it doesn't cause reconnections when it changes
+  const onUpdateRef = useRef(onUpdate);
+  onUpdateRef.current = onUpdate;
 
   const connect = useCallback(() => {
     if (!enabled) return;
@@ -26,7 +30,8 @@ export function useSSE({ onUpdate, enabled = true }: UseSSEOptions) {
 
     eventSource.addEventListener('update', (event) => {
       console.log('SSE update:', event.data);
-      onUpdate();
+      // Use the ref to always call the latest callback
+      onUpdateRef.current();
     });
 
     eventSource.onerror = () => {
@@ -41,7 +46,7 @@ export function useSSE({ onUpdate, enabled = true }: UseSSEOptions) {
         connect();
       }, 5000);
     };
-  }, [enabled, onUpdate]);
+  }, [enabled]); // Removed onUpdate from dependencies
 
   useEffect(() => {
     connect();

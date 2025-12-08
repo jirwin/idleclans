@@ -99,6 +99,31 @@ func (d *DB) initSchema() error {
 
 	CREATE INDEX IF NOT EXISTS idx_web_sessions_user ON web_sessions(user_id);
 	CREATE INDEX IF NOT EXISTS idx_web_sessions_expires ON web_sessions(expires_at);
+
+	CREATE TABLE IF NOT EXISTS parties (
+		id TEXT PRIMARY KEY,
+		players TEXT NOT NULL,
+		plan_data TEXT NOT NULL,
+		current_step_index INTEGER DEFAULT 0,
+		started_at TIMESTAMP,
+		ended_at TIMESTAMP,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS party_step_progress (
+		party_id TEXT NOT NULL,
+		step_index INTEGER NOT NULL,
+		boss_name TEXT NOT NULL,
+		kills_tracked INTEGER DEFAULT 0,
+		keys_used INTEGER DEFAULT 0,
+		started_at TIMESTAMP,
+		completed_at TIMESTAMP,
+		PRIMARY KEY (party_id, step_index),
+		FOREIGN KEY (party_id) REFERENCES parties(id)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_parties_created ON parties(created_at);
+	CREATE INDEX IF NOT EXISTS idx_party_step_progress_party ON party_step_progress(party_id);
 	`
 
 	_, err := d.db.Exec(schema)
@@ -902,5 +927,210 @@ func (d *DB) DeleteSession(ctx context.Context, sessionID string) error {
 func (d *DB) CleanupExpiredSessions(ctx context.Context) error {
 	query := `DELETE FROM web_sessions WHERE expires_at < CURRENT_TIMESTAMP`
 	_, err := d.db.ExecContext(ctx, query)
+	return err
+}
+
+// PartySession represents a party session
+type PartySession struct {
+	ID               string     `db:"id" json:"id"`
+	Players          string     `db:"players" json:"players"`               // JSON array of player names
+	PlanData         string     `db:"plan_data" json:"plan_data"`           // JSON of the generated plan
+	CurrentStepIndex int        `db:"current_step_index" json:"current_step_index"`
+	StartedAt        *time.Time `db:"started_at" json:"started_at"`
+	EndedAt          *time.Time `db:"ended_at" json:"ended_at"`
+	CreatedAt        time.Time  `db:"created_at" json:"created_at"`
+}
+
+// PartyStepProgress represents progress for a single step in a party
+type PartyStepProgress struct {
+	PartyID     string     `db:"party_id" json:"party_id"`
+	StepIndex   int        `db:"step_index" json:"step_index"`
+	BossName    string     `db:"boss_name" json:"boss_name"`
+	KillsTracked int       `db:"kills_tracked" json:"kills_tracked"`
+	KeysUsed    int        `db:"keys_used" json:"keys_used"`
+	StartedAt   *time.Time `db:"started_at" json:"started_at"`
+	CompletedAt *time.Time `db:"completed_at" json:"completed_at"`
+}
+
+// CreateParty creates a new party session
+func (d *DB) CreateParty(ctx context.Context, id string, players string, planData string) error {
+	l := ctxzap.Extract(ctx)
+	l.Info("Creating party", zap.String("id", id))
+
+	query := `
+		INSERT INTO parties (id, players, plan_data, current_step_index, created_at)
+		VALUES (?, ?, ?, 0, CURRENT_TIMESTAMP)
+	`
+	_, err := d.db.ExecContext(ctx, query, id, players, planData)
+	return err
+}
+
+// GetParty retrieves a party by ID
+func (d *DB) GetParty(ctx context.Context, id string) (*PartySession, error) {
+	var party PartySession
+	query := `SELECT id, players, plan_data, current_step_index, started_at, ended_at, created_at FROM parties WHERE id = ?`
+	err := d.db.GetContext(ctx, &party, query, id)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &party, nil
+}
+
+// StartParty marks the party as started
+func (d *DB) StartParty(ctx context.Context, id string) error {
+	query := `UPDATE parties SET started_at = CURRENT_TIMESTAMP WHERE id = ? AND started_at IS NULL`
+	_, err := d.db.ExecContext(ctx, query, id)
+	return err
+}
+
+// EndParty marks the party as ended
+func (d *DB) EndParty(ctx context.Context, id string) error {
+	query := `UPDATE parties SET ended_at = CURRENT_TIMESTAMP WHERE id = ? AND ended_at IS NULL`
+	_, err := d.db.ExecContext(ctx, query, id)
+	return err
+}
+
+// UpdatePartyStepIndex updates the current step index for a party
+func (d *DB) UpdatePartyStepIndex(ctx context.Context, id string, stepIndex int) error {
+	query := `UPDATE parties SET current_step_index = ? WHERE id = ?`
+	_, err := d.db.ExecContext(ctx, query, stepIndex, id)
+	return err
+}
+
+// GetPartyStepProgress retrieves progress for a specific step
+func (d *DB) GetPartyStepProgress(ctx context.Context, partyID string, stepIndex int) (*PartyStepProgress, error) {
+	var progress PartyStepProgress
+	query := `SELECT party_id, step_index, boss_name, kills_tracked, keys_used, started_at, completed_at 
+	          FROM party_step_progress WHERE party_id = ? AND step_index = ?`
+	err := d.db.GetContext(ctx, &progress, query, partyID, stepIndex)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &progress, nil
+}
+
+// GetAllPartyStepProgress retrieves all step progress for a party
+func (d *DB) GetAllPartyStepProgress(ctx context.Context, partyID string) ([]PartyStepProgress, error) {
+	var progress []PartyStepProgress
+	query := `SELECT party_id, step_index, boss_name, kills_tracked, keys_used, started_at, completed_at 
+	          FROM party_step_progress WHERE party_id = ? ORDER BY step_index`
+	err := d.db.SelectContext(ctx, &progress, query, partyID)
+	return progress, err
+}
+
+// UpsertPartyStepProgress creates or updates step progress
+func (d *DB) UpsertPartyStepProgress(ctx context.Context, partyID string, stepIndex int, bossName string, killsTracked int, keysUsed int) error {
+	query := `
+		INSERT INTO party_step_progress (party_id, step_index, boss_name, kills_tracked, keys_used, started_at)
+		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(party_id, step_index) DO UPDATE SET
+			kills_tracked = excluded.kills_tracked,
+			keys_used = excluded.keys_used
+	`
+	_, err := d.db.ExecContext(ctx, query, partyID, stepIndex, bossName, killsTracked, keysUsed)
+	return err
+}
+
+// StartPartyStep marks a step as started
+func (d *DB) StartPartyStep(ctx context.Context, partyID string, stepIndex int, bossName string) error {
+	query := `
+		INSERT INTO party_step_progress (party_id, step_index, boss_name, kills_tracked, keys_used, started_at)
+		VALUES (?, ?, ?, 0, 0, CURRENT_TIMESTAMP)
+		ON CONFLICT(party_id, step_index) DO UPDATE SET
+			started_at = COALESCE(party_step_progress.started_at, CURRENT_TIMESTAMP)
+	`
+	_, err := d.db.ExecContext(ctx, query, partyID, stepIndex, bossName)
+	return err
+}
+
+// CompletePartyStep marks a step as completed
+func (d *DB) CompletePartyStep(ctx context.Context, partyID string, stepIndex int) error {
+	query := `UPDATE party_step_progress SET completed_at = CURRENT_TIMESTAMP WHERE party_id = ? AND step_index = ?`
+	_, err := d.db.ExecContext(ctx, query, partyID, stepIndex)
+	return err
+}
+
+// UpdatePartyStepKills updates the kill count for a step
+func (d *DB) UpdatePartyStepKills(ctx context.Context, partyID string, stepIndex int, kills int) error {
+	query := `UPDATE party_step_progress SET kills_tracked = ? WHERE party_id = ? AND step_index = ?`
+	_, err := d.db.ExecContext(ctx, query, kills, partyID, stepIndex)
+	return err
+}
+
+// UpdatePartyStepKeys updates the keys used for a step
+func (d *DB) UpdatePartyStepKeys(ctx context.Context, partyID string, stepIndex int, keysUsed int) error {
+	query := `UPDATE party_step_progress SET keys_used = ? WHERE party_id = ? AND step_index = ?`
+	_, err := d.db.ExecContext(ctx, query, keysUsed, partyID, stepIndex)
+	return err
+}
+
+// IncrementQuestCurrentKills increases the current_kills for players with a specific boss quest
+func (d *DB) IncrementQuestCurrentKills(ctx context.Context, playerNames []string, bossName string, weekNumber, year int, killsDelta int) error {
+	if len(playerNames) == 0 || killsDelta == 0 {
+		return nil
+	}
+
+	// Build placeholders for player names
+	placeholders := ""
+	args := make([]interface{}, 0, len(playerNames)+4)
+	for i, name := range playerNames {
+		if i > 0 {
+			placeholders += ","
+		}
+		placeholders += "?"
+		args = append(args, name)
+	}
+	args = append(args, killsDelta, bossName, weekNumber, year)
+
+	query := fmt.Sprintf(`
+		UPDATE weekly_quests 
+		SET current_kills = current_kills + ?
+		WHERE player_name IN (%s) AND boss_name = ? AND week_number = ? AND year = ?
+	`, placeholders)
+
+	// Reorder args: killsDelta first for the SET clause
+	reorderedArgs := make([]interface{}, 0, len(args))
+	reorderedArgs = append(reorderedArgs, killsDelta)
+	for _, name := range playerNames {
+		reorderedArgs = append(reorderedArgs, name)
+	}
+	reorderedArgs = append(reorderedArgs, bossName, weekNumber, year)
+
+	_, err := d.db.ExecContext(ctx, query, reorderedArgs...)
+	return err
+}
+
+// SetQuestCurrentKills sets the current_kills for players with a specific boss quest
+func (d *DB) SetQuestCurrentKills(ctx context.Context, playerNames []string, bossName string, weekNumber, year int, kills int) error {
+	if len(playerNames) == 0 {
+		return nil
+	}
+
+	// Build placeholders for player names
+	placeholders := ""
+	args := make([]interface{}, 0, len(playerNames)+4)
+	args = append(args, kills)
+	for i, name := range playerNames {
+		if i > 0 {
+			placeholders += ","
+		}
+		placeholders += "?"
+		args = append(args, name)
+	}
+	args = append(args, bossName, weekNumber, year)
+
+	query := fmt.Sprintf(`
+		UPDATE weekly_quests 
+		SET current_kills = ?
+		WHERE player_name IN (%s) AND boss_name = ? AND week_number = ? AND year = ?
+	`, placeholders)
+
+	_, err := d.db.ExecContext(ctx, query, args...)
 	return err
 }

@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { ClanBossData, ClanKeysData, PlanData } from '../types';
 import { BOSSES, KEY_TYPES } from '../types';
-import { fetchClanBosses, fetchClanKeys, fetchClanPlan, fetchClanPlayers, sendPlanToDiscord } from '../api';
+import { fetchClanBosses, fetchClanKeys, fetchClanPlan, fetchClanPlayers, sendPlanToDiscord, createParty } from '../api';
 import { useSSE } from '../hooks/useSSE';
 
 type TabType = 'bosses' | 'keys' | 'plan';
@@ -24,6 +24,7 @@ export function Clan() {
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const [sent, setSent] = useState(false);
+  const [startingParty, setStartingParty] = useState(false);
   
   // Selected players for plan (up to 3)
   const [selectedPlayers, setSelectedPlayers] = useState<Set<string>>(new Set());
@@ -112,6 +113,19 @@ export function Clan() {
       setSendError(err instanceof Error ? err.message : 'Failed to send');
     } finally {
       setSending(false);
+    }
+  };
+
+  const handleStartParty = async () => {
+    if (selectedPlayers.size === 0) return;
+    setStartingParty(true);
+    try {
+      const result = await createParty(Array.from(selectedPlayers));
+      navigate(`/party/${result.id}`);
+    } catch (err) {
+      console.error('Failed to start party:', err);
+    } finally {
+      setStartingParty(false);
     }
   };
 
@@ -446,23 +460,36 @@ export function Clan() {
                       Week {planData.week}, {planData.year} • Groups to minimize party switching
                     </p>
                   </div>
-                  <button
-                    onClick={() => setShowSendConfirm(true)}
-                    disabled={sending}
-                    className={`px-4 py-2 text-sm font-medium rounded-lg transition-colors flex items-center gap-2 ${
-                      sent
-                        ? 'bg-emerald-600 text-white'
-                        : 'bg-indigo-600 hover:bg-indigo-700 text-white'
-                    }`}
-                  >
-                    {sent ? (
-                      <>✓ Sent!</>
-                    ) : sending ? (
-                      <>Sending...</>
-                    ) : (
-                      <>📤 Send to Discord</>
-                    )}
-                  </button>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <button
+                      onClick={handleStartParty}
+                      disabled={startingParty}
+                      className="px-4 py-2 text-sm font-medium rounded-lg transition-colors flex items-center gap-2 bg-pink-600 hover:bg-pink-700 disabled:bg-gray-600 text-white"
+                    >
+                      {startingParty ? (
+                        <>Starting...</>
+                      ) : (
+                        <>🎮 Start Party</>
+                      )}
+                    </button>
+                    <button
+                      onClick={() => setShowSendConfirm(true)}
+                      disabled={sending}
+                      className={`px-4 py-2 text-sm font-medium rounded-lg transition-colors flex items-center gap-2 ${
+                        sent
+                          ? 'bg-emerald-600 text-white'
+                          : 'bg-indigo-600 hover:bg-indigo-700 text-white'
+                      }`}
+                    >
+                      {sent ? (
+                        <>✓ Sent!</>
+                      ) : sending ? (
+                        <>Sending...</>
+                      ) : (
+                        <>📤 Send to Discord</>
+                      )}
+                    </button>
+                  </div>
                 </div>
 
                 {planData.parties.length === 0 && planData.leftovers.length === 0 ? (
