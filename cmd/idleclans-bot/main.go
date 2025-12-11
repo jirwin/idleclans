@@ -125,10 +125,18 @@ func main() {
 	discordClientSecret := getCredential("discord_client_secret", "DISCORD_CLIENT_SECRET")
 
 	if discordClientID != "" && discordClientSecret != "" {
+		// Get database connection string from environment
+		dbURL := os.Getenv("DATABASE_URL")
+		if dbURL == "" {
+			// Fallback to SQLite for backward compatibility
+			sqlitePath := getEnvString("SQLITE_DB_PATH", "quests.db")
+			dbURL = "sqlite://" + sqlitePath
+		}
+		
 		// Create database connection for web server
-		webDB, err := quests.NewDB("quests.db")
+		webDB, err := quests.NewDB(dbURL)
 		if err != nil {
-			l.Error("Failed to open database for web server", zap.Error(err))
+			l.Error("Failed to open database for web server", zap.Error(err), zap.String("db_url", dbURL))
 			os.Exit(1)
 		}
 		defer webDB.Close()

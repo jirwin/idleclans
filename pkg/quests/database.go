@@ -9,21 +9,45 @@ import (
 
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"github.com/jmoiron/sqlx"
+	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
 	"go.uber.org/zap"
 )
 
 type DB struct {
-	db *sqlx.DB
+	db     *sqlx.DB
+	driver string // "sqlite3" or "postgres"
 }
 
-func NewDB(dbPath string) (*DB, error) {
-	db, err := sqlx.Open("sqlite3", dbPath)
+// NewDB creates a new database connection. It accepts a connection string that can be:
+// - PostgreSQL: "postgres://..." or "postgresql://..."
+// - SQLite: "sqlite://path/to/file.db" or "file:path/to/file.db" or just a file path
+func NewDB(connectionString string) (*DB, error) {
+	var driver string
+	var connStr string
+
+	// Detect database type from connection string
+	if strings.HasPrefix(connectionString, "postgres://") || strings.HasPrefix(connectionString, "postgresql://") {
+		driver = "postgres"
+		connStr = connectionString
+	} else if strings.HasPrefix(connectionString, "sqlite://") {
+		driver = "sqlite3"
+		connStr = strings.TrimPrefix(connectionString, "sqlite://")
+	} else if strings.HasPrefix(connectionString, "file:") {
+		driver = "sqlite3"
+		connStr = connectionString
+	} else {
+		// Default to SQLite for backward compatibility
+		driver = "sqlite3"
+		connStr = connectionString
+	}
+
+	db, err := sqlx.Open(driver, connStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	d := &DB{db: db}
+	d := &DB{db: db, driver: driver}
 	if err := d.initSchema(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
@@ -37,7 +61,62 @@ func (d *DB) Close() error {
 }
 
 func (d *DB) initSchema() error {
-	schema := `
+	var schema string
+	if d.driver == "postgres" {
+		schema = d.getPostgreSQLSchema()
+	} else {
+		schema = d.getSQLiteSchema()
+	}
+
+	_, err := d.db.Exec(schema)
+	if err != nil {
+		return err
+	}
+
+	// Migration: Add max_required_kills column if it doesn't exist
+	// This handles existing databases that were created before this column was added
+	// SQLite's ALTER TABLE ADD COLUMN will fail if column exists, so we ignore that error
+	_, _ = d.db.Exec(`ALTER TABLE weekly_quests ADD COLUMN max_required_kills INTEGER`)
+
+	// Update existing rows to set max_required_kills = required_kills if it's NULL
+	// This handles both new columns (which will be NULL) and ensures consistency
+	_, _ = d.db.Exec(`UPDATE weekly_quests SET max_required_kills = required_kills WHERE max_required_kills IS NULL`)
+
+	// Migration: Fix unique constraint to include player_name (allows separate quests for main and alts)
+	// SQLite doesn't support dropping constraints, so we need to recreate the table
+	if err := d.migrateWeeklyQuestsUniqueConstraint(); err != nil {
+		// Log but don't fail - migration errors shouldn't prevent startup
+		fmt.Printf("Warning: Failed to migrate weekly_quests unique constraint: %v\n", err)
+	}
+
+	// Migration: Convert player_keys from discord_user_id to player_name
+	// Check if old schema exists (has discord_user_id column)
+	var hasOldSchema bool
+	var count int
+	
+	if d.driver == "postgres" {
+		row := d.db.QueryRow(`SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'player_keys' AND column_name = 'discord_user_id'`)
+		err = row.Scan(&count)
+	} else {
+		row := d.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('player_keys') WHERE name='discord_user_id'`)
+		err = row.Scan(&count)
+	}
+	
+	if err == nil && count > 0 {
+		hasOldSchema = true
+	}
+
+	if hasOldSchema {
+		if err := d.migratePlayerKeysToPlayerName(); err != nil {
+			return fmt.Errorf("failed to migrate player_keys: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (d *DB) getSQLiteSchema() string {
+	return `
 	CREATE TABLE IF NOT EXISTS players (
 		discord_user_id TEXT PRIMARY KEY,
 		player_name TEXT NOT NULL,
@@ -126,48 +205,108 @@ func (d *DB) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_parties_created ON parties(created_at);
 	CREATE INDEX IF NOT EXISTS idx_party_step_progress_party ON party_step_progress(party_id);
 	`
+}
 
-	_, err := d.db.Exec(schema)
-	if err != nil {
-		return err
-	}
+func (d *DB) getPostgreSQLSchema() string {
+	return `
+	CREATE TABLE IF NOT EXISTS players (
+		discord_user_id TEXT PRIMARY KEY,
+		player_name TEXT NOT NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
 
-	// Migration: Add max_required_kills column if it doesn't exist
-	// This handles existing databases that were created before this column was added
-	// SQLite's ALTER TABLE ADD COLUMN will fail if column exists, so we ignore that error
-	_, _ = d.db.Exec(`ALTER TABLE weekly_quests ADD COLUMN max_required_kills INTEGER`)
+	CREATE TABLE IF NOT EXISTS weekly_quests (
+		id SERIAL PRIMARY KEY,
+		discord_user_id TEXT NOT NULL,
+		player_name TEXT NOT NULL,
+		week_number INTEGER NOT NULL,
+		year INTEGER NOT NULL,
+		boss_name TEXT NOT NULL,
+		required_kills INTEGER NOT NULL,
+		max_required_kills INTEGER NOT NULL,
+		current_kills INTEGER DEFAULT 0,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(discord_user_id, player_name, week_number, year, boss_name)
+	);
 
-	// Update existing rows to set max_required_kills = required_kills if it's NULL
-	// This handles both new columns (which will be NULL) and ensures consistency
-	_, _ = d.db.Exec(`UPDATE weekly_quests SET max_required_kills = required_kills WHERE max_required_kills IS NULL`)
+	CREATE TABLE IF NOT EXISTS quest_kills (
+		id SERIAL PRIMARY KEY,
+		quest_id INTEGER NOT NULL,
+		kills_completed INTEGER NOT NULL,
+		recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY(quest_id) REFERENCES weekly_quests(id)
+	);
 
-	// Migration: Fix unique constraint to include player_name (allows separate quests for main and alts)
-	// SQLite doesn't support dropping constraints, so we need to recreate the table
-	if err := d.migrateWeeklyQuestsUniqueConstraint(); err != nil {
-		// Log but don't fail - migration errors shouldn't prevent startup
-		fmt.Printf("Warning: Failed to migrate weekly_quests unique constraint: %v\n", err)
-	}
+	CREATE INDEX IF NOT EXISTS idx_weekly_quests_user_week ON weekly_quests(discord_user_id, week_number, year);
+	CREATE INDEX IF NOT EXISTS idx_weekly_quests_player_week ON weekly_quests(player_name, week_number, year);
+	CREATE INDEX IF NOT EXISTS idx_quest_kills_quest_id ON quest_kills(quest_id);
+	
+	CREATE TABLE IF NOT EXISTS player_keys (
+		player_name TEXT NOT NULL,
+		key_type TEXT NOT NULL,
+		count INTEGER NOT NULL DEFAULT 0,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (player_name, key_type)
+	);
 
-	// Migration: Convert player_keys from discord_user_id to player_name
-	// Check if old schema exists (has discord_user_id column)
-	var hasOldSchema bool
-	row := d.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('player_keys') WHERE name='discord_user_id'`)
-	var count int
-	if err := row.Scan(&count); err == nil && count > 0 {
-		hasOldSchema = true
-	}
+	CREATE TABLE IF NOT EXISTS player_alts (
+		discord_user_id TEXT NOT NULL,
+		player_name TEXT NOT NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (discord_user_id, player_name)
+	);
 
-	if hasOldSchema {
-		if err := d.migratePlayerKeysToPlayerName(); err != nil {
-			return fmt.Errorf("failed to migrate player_keys: %w", err)
-		}
-	}
+	CREATE INDEX IF NOT EXISTS idx_player_alts_user ON player_alts(discord_user_id);
 
-	return nil
+	CREATE TABLE IF NOT EXISTS web_sessions (
+		session_id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		username TEXT NOT NULL,
+		avatar TEXT,
+		expires_at TIMESTAMP NOT NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_web_sessions_user ON web_sessions(user_id);
+	CREATE INDEX IF NOT EXISTS idx_web_sessions_expires ON web_sessions(expires_at);
+
+	CREATE TABLE IF NOT EXISTS parties (
+		id TEXT PRIMARY KEY,
+		players TEXT NOT NULL,
+		plan_data TEXT NOT NULL,
+		current_step_index INTEGER DEFAULT 0,
+		started_at TIMESTAMP,
+		ended_at TIMESTAMP,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS party_step_progress (
+		party_id TEXT NOT NULL,
+		step_index INTEGER NOT NULL,
+		boss_name TEXT NOT NULL,
+		kills_tracked INTEGER DEFAULT 0,
+		keys_used INTEGER DEFAULT 0,
+		started_at TIMESTAMP,
+		completed_at TIMESTAMP,
+		PRIMARY KEY (party_id, step_index),
+		FOREIGN KEY (party_id) REFERENCES parties(id)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_parties_created ON parties(created_at);
+	CREATE INDEX IF NOT EXISTS idx_party_step_progress_party ON party_step_progress(party_id);
+	`
 }
 
 // migrateWeeklyQuestsUniqueConstraint migrates the weekly_quests table to include player_name in unique constraint
+// This migration only applies to SQLite databases
 func (d *DB) migrateWeeklyQuestsUniqueConstraint() error {
+	// This migration only applies to SQLite
+	if d.driver == "postgres" {
+		return nil
+	}
+	
 	// Check if migration is needed by checking if the old constraint exists
 	// We can detect this by checking if there are any duplicate player_name entries for same discord_user_id/boss/week/year
 	// But simpler: just check if table exists and try to create the new constraint index
@@ -310,12 +449,24 @@ func (d *DB) migratePlayerKeysToPlayerName() error {
 
 	// Copy data from old table, joining with players to get player_name
 	// Using INNER JOIN intentionally - orphaned records are logged above and cannot be migrated
-	result, err := d.db.Exec(`
-		INSERT OR IGNORE INTO player_keys_new (player_name, key_type, count, updated_at)
-		SELECT p.player_name, pk.key_type, pk.count, pk.updated_at
-		FROM player_keys pk
-		JOIN players p ON pk.discord_user_id = p.discord_user_id
-	`)
+	var insertQuery string
+	if d.driver == "postgres" {
+		insertQuery = `
+			INSERT INTO player_keys_new (player_name, key_type, count, updated_at)
+			SELECT p.player_name, pk.key_type, pk.count, pk.updated_at
+			FROM player_keys pk
+			JOIN players p ON pk.discord_user_id = p.discord_user_id
+			ON CONFLICT (player_name, key_type) DO NOTHING
+		`
+	} else {
+		insertQuery = `
+			INSERT OR IGNORE INTO player_keys_new (player_name, key_type, count, updated_at)
+			SELECT p.player_name, pk.key_type, pk.count, pk.updated_at
+			FROM player_keys pk
+			JOIN players p ON pk.discord_user_id = p.discord_user_id
+		`
+	}
+	result, err := d.db.Exec(insertQuery)
 	if err != nil {
 		// Cleanup on failure
 		d.db.Exec(`DROP TABLE IF EXISTS player_keys_new`)
@@ -350,6 +501,7 @@ func (d *DB) RegisterPlayer(ctx context.Context, discordUserID, playerName strin
 			player_name = excluded.player_name,
 			updated_at = CURRENT_TIMESTAMP
 	`
+	query = d.db.Rebind(query)
 	_, err := d.db.ExecContext(ctx, query, discordUserID, playerName)
 	return err
 }
@@ -358,6 +510,7 @@ func (d *DB) RegisterPlayer(ctx context.Context, discordUserID, playerName strin
 func (d *DB) GetPlayerName(ctx context.Context, discordUserID string) (string, error) {
 	var playerName string
 	query := `SELECT player_name FROM players WHERE discord_user_id = ?`
+	query = d.db.Rebind(query)
 	err := d.db.GetContext(ctx, &playerName, query, discordUserID)
 	if err == sql.ErrNoRows {
 		return "", fmt.Errorf("no default player name registered")
@@ -435,6 +588,7 @@ func (d *DB) UpsertQuest(ctx context.Context, discordUserID, playerName string, 
 	var existing WeeklyQuestRow
 	query := `SELECT id, required_kills, max_required_kills, current_kills FROM weekly_quests 
 		WHERE discord_user_id = ? AND player_name = ? AND week_number = ? AND year = ? AND boss_name = ?`
+	query = d.db.Rebind(query)
 	err := d.db.GetContext(ctx, &existing, query, discordUserID, playerName, weekNumber, year, bossName)
 
 	if err == sql.ErrNoRows {
@@ -443,6 +597,7 @@ func (d *DB) UpsertQuest(ctx context.Context, discordUserID, playerName string, 
 			INSERT INTO weekly_quests (discord_user_id, player_name, week_number, year, boss_name, required_kills, max_required_kills, current_kills, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 		`
+		insertQuery = d.db.Rebind(insertQuery)
 		_, err = d.db.ExecContext(ctx, insertQuery, discordUserID, playerName, weekNumber, year, bossName, requiredKills, requiredKills)
 		if err != nil {
 			return err
@@ -511,6 +666,7 @@ func (d *DB) UpsertQuest(ctx context.Context, discordUserID, playerName string, 
 		if delta > 0 {
 			// Record the delta in quest_kills table (only when kills are actually completed)
 			killQuery := `INSERT INTO quest_kills (quest_id, kills_completed, recorded_at) VALUES (?, ?, CURRENT_TIMESTAMP)`
+			killQuery = d.db.Rebind(killQuery)
 			_, err = d.db.ExecContext(ctx, killQuery, existing.ID, delta)
 			if err != nil {
 				l.Error("Failed to record kill delta", zap.Error(err))
@@ -524,6 +680,7 @@ func (d *DB) UpsertQuest(ctx context.Context, discordUserID, playerName string, 
 			SET required_kills = ?, max_required_kills = ?, current_kills = ?, updated_at = CURRENT_TIMESTAMP
 			WHERE id = ?
 		`
+		updateQuery = d.db.Rebind(updateQuery)
 		_, err = d.db.ExecContext(ctx, updateQuery, requiredKills, newMaxRequired, newCurrentKills, existing.ID)
 		if err != nil {
 			return err
@@ -543,6 +700,7 @@ func (d *DB) UpdateQuestRequiredKills(ctx context.Context, discordUserID, player
 	var existing WeeklyQuestRow
 	query := `SELECT id, required_kills, max_required_kills, current_kills FROM weekly_quests 
 		WHERE discord_user_id = ? AND week_number = ? AND year = ? AND boss_name = ?`
+	query = d.db.Rebind(query)
 	err := d.db.GetContext(ctx, &existing, query, discordUserID, weekNumber, year, bossName)
 
 	if err == sql.ErrNoRows {
@@ -572,6 +730,7 @@ func (d *DB) UpdateQuestRequiredKills(ctx context.Context, discordUserID, player
 		SET required_kills = ?, max_required_kills = ?, current_kills = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?
 	`
+	updateQuery = d.db.Rebind(updateQuery)
 	_, err = d.db.ExecContext(ctx, updateQuery, requiredKills, newMaxRequired, existing.CurrentKills, existing.ID)
 	if err != nil {
 		return err
@@ -596,6 +755,7 @@ func (d *DB) GetPlayerQuests(ctx context.Context, playerName string, weekNumber,
 		WHERE player_name = ? AND week_number = ? AND year = ?
 		ORDER BY boss_name
 	`
+	query = d.db.Rebind(query)
 	var quests []Quest
 	err := d.db.SelectContext(ctx, &quests, query, playerName, weekNumber, year)
 	return quests, err
@@ -609,6 +769,7 @@ func (d *DB) GetPlayerQuestsByDiscordID(ctx context.Context, discordUserID strin
 		WHERE discord_user_id = ? AND week_number = ? AND year = ?
 		ORDER BY boss_name
 	`
+	query = d.db.Rebind(query)
 	var quests []Quest
 	err := d.db.SelectContext(ctx, &quests, query, discordUserID, weekNumber, year)
 	return quests, err
@@ -622,6 +783,7 @@ func (d *DB) GetAllQuestsForWeek(ctx context.Context, weekNumber, year int) ([]Q
 		WHERE week_number = ? AND year = ?
 		ORDER BY player_name, boss_name
 	`
+	query = d.db.Rebind(query)
 	var quests []Quest
 	err := d.db.SelectContext(ctx, &quests, query, weekNumber, year)
 	return quests, err
@@ -646,6 +808,7 @@ func (d *DB) GetPlayersWithMatchingQuests(ctx context.Context, playerName string
 		FROM weekly_quests
 		WHERE player_name = ? AND week_number = ? AND year = ?
 	`
+	playerBossesQuery = d.db.Rebind(playerBossesQuery)
 	type bossNameRow struct {
 		BossName string `db:"boss_name"`
 	}
@@ -691,6 +854,7 @@ func (d *DB) GetPlayersWithMatchingQuests(ctx context.Context, playerName string
 	}
 	args = append(args, playerName)
 
+	query = d.db.Rebind(query)
 	var results []PlayerQuestInfo
 	err = d.db.SelectContext(ctx, &results, query, args...)
 	if err != nil {
@@ -704,6 +868,7 @@ func (d *DB) GetPlayersWithMatchingQuests(ctx context.Context, playerName string
 		// Check if this player is someone's main
 		var ownerID string
 		mainQuery := `SELECT discord_user_id FROM players WHERE player_name = ?`
+		mainQuery = d.db.Rebind(mainQuery)
 		err := d.db.GetContext(ctx, &ownerID, mainQuery, pName)
 		if err == nil && ownerID != results[i].DiscordUserID {
 			results[i].DiscordUserID = ownerID
@@ -712,7 +877,8 @@ func (d *DB) GetPlayersWithMatchingQuests(ctx context.Context, playerName string
 
 		// Check if this player is someone's alt
 		altQuery := `SELECT discord_user_id FROM player_alts WHERE player_name = ?`
-		err = d.db.GetContext(ctx, &altQuery, altQuery, pName)
+		altQuery = d.db.Rebind(altQuery)
+		err = d.db.GetContext(ctx, &ownerID, altQuery, pName)
 		if err == nil && ownerID != results[i].DiscordUserID {
 			results[i].DiscordUserID = ownerID
 		}
@@ -732,6 +898,7 @@ func (d *DB) GetPlayersWithBossQuest(ctx context.Context, bossName string, weekN
 		AND (wq.required_kills - wq.current_kills) > 0
 		ORDER BY wq.player_name
 	`
+	query = d.db.Rebind(query)
 
 	var results []PlayerQuestInfo
 	err := d.db.SelectContext(ctx, &results, query, weekNumber, year, bossName)
@@ -747,6 +914,7 @@ func (d *DB) GetPlayersWithBossQuest(ctx context.Context, bossName string, weekN
 		// Check if this player is someone's main
 		var ownerID string
 		mainQuery := `SELECT discord_user_id FROM players WHERE player_name = ?`
+		mainQuery = d.db.Rebind(mainQuery)
 		err := d.db.GetContext(ctx, &ownerID, mainQuery, playerName)
 		if err == nil && ownerID != results[i].DiscordUserID {
 			// Player is owned by someone else - update to their discord_user_id
@@ -756,6 +924,7 @@ func (d *DB) GetPlayersWithBossQuest(ctx context.Context, bossName string, weekN
 
 		// Check if this player is someone's alt
 		altQuery := `SELECT discord_user_id FROM player_alts WHERE player_name = ?`
+		altQuery = d.db.Rebind(altQuery)
 		err = d.db.GetContext(ctx, &ownerID, altQuery, playerName)
 		if err == nil && ownerID != results[i].DiscordUserID {
 			// Player is an alt owned by someone else - update to their discord_user_id
@@ -777,7 +946,7 @@ func (d *DB) UpsertPlayerKeys(ctx context.Context, playerName string, keyType st
 			count = excluded.count,
 			updated_at = CURRENT_TIMESTAMP
 	`
-
+	query = d.db.Rebind(query)
 	_, err := d.db.ExecContext(ctx, query, playerName, keyType, count)
 	if err != nil {
 		l.Error("Failed to upsert player keys", zap.Error(err), zap.String("player_name", playerName), zap.String("key", keyType), zap.Int("count", count))
@@ -790,6 +959,7 @@ func (d *DB) UpsertPlayerKeys(ctx context.Context, playerName string, keyType st
 // GetPlayerKeys returns all key counts for a player (by player name)
 func (d *DB) GetPlayerKeys(ctx context.Context, playerName string) (map[string]int, error) {
 	query := `SELECT key_type, count FROM player_keys WHERE player_name = ?`
+	query = d.db.Rebind(query)
 
 	type keyRow struct {
 		KeyType string `db:"key_type"`
@@ -814,6 +984,7 @@ func (d *DB) GetPlayerKeys(ctx context.Context, playerName string) (map[string]i
 func (d *DB) GetPlayerKeyCount(ctx context.Context, playerName string, keyType string) (int, error) {
 	var count int
 	query := `SELECT count FROM player_keys WHERE player_name = ? AND key_type = ?`
+	query = d.db.Rebind(query)
 
 	err := d.db.GetContext(ctx, &count, query, playerName, keyType)
 	if err == sql.ErrNoRows {
@@ -856,6 +1027,7 @@ func (d *DB) RegisterAlt(ctx context.Context, discordUserID, playerName string) 
 		VALUES (?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(discord_user_id, player_name) DO NOTHING
 	`
+	query = d.db.Rebind(query)
 	_, err := d.db.ExecContext(ctx, query, discordUserID, playerName)
 	return err
 }
@@ -873,6 +1045,7 @@ func (d *DB) RemoveAlt(ctx context.Context, discordUserID, playerName string) er
 // GetAlts returns all alternate player names for a Discord user
 func (d *DB) GetAlts(ctx context.Context, discordUserID string) ([]string, error) {
 	query := `SELECT player_name FROM player_alts WHERE discord_user_id = ? ORDER BY player_name`
+	query = d.db.Rebind(query)
 
 	var alts []string
 	err := d.db.SelectContext(ctx, &alts, query, discordUserID)
@@ -962,6 +1135,7 @@ func (d *DB) GetDiscordUserIDForPlayer(ctx context.Context, playerName string) (
 	// Check main players table first
 	var discordUserID string
 	query := `SELECT discord_user_id FROM players WHERE player_name = ?`
+	query = d.db.Rebind(query)
 	err := d.db.GetContext(ctx, &discordUserID, query, playerName)
 	if err == nil {
 		return discordUserID, nil
@@ -972,6 +1146,7 @@ func (d *DB) GetDiscordUserIDForPlayer(ctx context.Context, playerName string) (
 
 	// Check alts table
 	query = `SELECT discord_user_id FROM player_alts WHERE player_name = ?`
+	query = d.db.Rebind(query)
 	err = d.db.GetContext(ctx, &discordUserID, query, playerName)
 	if err == sql.ErrNoRows {
 		return "", fmt.Errorf("player not found")
@@ -1003,6 +1178,8 @@ func (d *DB) CreateSession(ctx context.Context, sessionID, userID, username, ava
 			avatar = excluded.avatar,
 			expires_at = excluded.expires_at
 	`
+	// Rebind query for the specific database driver
+	query = d.db.Rebind(query)
 	_, err := d.db.ExecContext(ctx, query, sessionID, userID, username, avatar, expiresAt)
 	return err
 }
@@ -1011,6 +1188,7 @@ func (d *DB) CreateSession(ctx context.Context, sessionID, userID, username, ava
 func (d *DB) GetSession(ctx context.Context, sessionID string) (*WebSession, error) {
 	var session WebSession
 	query := `SELECT session_id, user_id, username, avatar, expires_at FROM web_sessions WHERE session_id = ?`
+	query = d.db.Rebind(query)
 	err := d.db.GetContext(ctx, &session, query, sessionID)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -1024,6 +1202,7 @@ func (d *DB) GetSession(ctx context.Context, sessionID string) (*WebSession, err
 // DeleteSession deletes a web session
 func (d *DB) DeleteSession(ctx context.Context, sessionID string) error {
 	query := `DELETE FROM web_sessions WHERE session_id = ?`
+	query = d.db.Rebind(query)
 	_, err := d.db.ExecContext(ctx, query, sessionID)
 	return err
 }
@@ -1074,6 +1253,7 @@ func (d *DB) CreateParty(ctx context.Context, id string, players string, planDat
 func (d *DB) GetParty(ctx context.Context, id string) (*PartySession, error) {
 	var party PartySession
 	query := `SELECT id, players, plan_data, current_step_index, started_at, ended_at, created_at FROM parties WHERE id = ?`
+	query = d.db.Rebind(query)
 	err := d.db.GetContext(ctx, &party, query, id)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -1096,16 +1276,25 @@ func (d *DB) GetPartiesForUser(ctx context.Context, discordUserID string, limit 
 		return []PartySession{}, nil
 	}
 
-	// Use SQLite JSON functions to check if the players array contains any of our player names
-	// We'll use json_each to iterate through the array and check for matches
+	// Use database-specific JSON functions to check if the players array contains any of our player names
 	var conditions []string
 	var args []interface{}
+	
 	for _, name := range playerNames {
-		// Use json_each to check if the name exists in the players JSON array
-		conditions = append(conditions, `EXISTS (
-			SELECT 1 FROM json_each(parties.players) 
-			WHERE json_each.value = ?
-		)`)
+		if d.driver == "postgres" {
+			// PostgreSQL: use jsonb_array_elements_text
+			// Use ? and let sqlx convert it to $1, $2, etc.
+			conditions = append(conditions, `EXISTS (
+				SELECT 1 FROM jsonb_array_elements_text(parties.players::jsonb) AS value
+				WHERE value = ?
+			)`)
+		} else {
+			// SQLite: use json_each
+			conditions = append(conditions, `EXISTS (
+				SELECT 1 FROM json_each(parties.players) 
+				WHERE json_each.value = ?
+			)`)
+		}
 		args = append(args, name)
 	}
 
@@ -1121,6 +1310,9 @@ func (d *DB) GetPartiesForUser(ctx context.Context, discordUserID string, limit 
 		LIMIT ?
 	`, whereClause)
 	args = append(args, limit)
+	
+	// Rebind query for the specific database driver
+	query = d.db.Rebind(query)
 
 	var parties []PartySession
 	err = d.db.SelectContext(ctx, &parties, query, args...)
@@ -1156,6 +1348,7 @@ func (d *DB) GetPartyStepProgress(ctx context.Context, partyID string, stepIndex
 	var progress PartyStepProgress
 	query := `SELECT party_id, step_index, boss_name, kills_tracked, keys_used, started_at, completed_at 
 	          FROM party_step_progress WHERE party_id = ? AND step_index = ?`
+	query = d.db.Rebind(query)
 	err := d.db.GetContext(ctx, &progress, query, partyID, stepIndex)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -1171,6 +1364,7 @@ func (d *DB) GetAllPartyStepProgress(ctx context.Context, partyID string) ([]Par
 	var progress []PartyStepProgress
 	query := `SELECT party_id, step_index, boss_name, kills_tracked, keys_used, started_at, completed_at 
 	          FROM party_step_progress WHERE party_id = ? ORDER BY step_index`
+	query = d.db.Rebind(query)
 	err := d.db.SelectContext(ctx, &progress, query, partyID)
 	return progress, err
 }
@@ -1184,6 +1378,7 @@ func (d *DB) UpsertPartyStepProgress(ctx context.Context, partyID string, stepIn
 			kills_tracked = excluded.kills_tracked,
 			keys_used = excluded.keys_used
 	`
+	query = d.db.Rebind(query)
 	_, err := d.db.ExecContext(ctx, query, partyID, stepIndex, bossName, killsTracked, keysUsed)
 	return err
 }
@@ -1196,6 +1391,7 @@ func (d *DB) StartPartyStep(ctx context.Context, partyID string, stepIndex int, 
 		ON CONFLICT(party_id, step_index) DO UPDATE SET
 			started_at = COALESCE(party_step_progress.started_at, CURRENT_TIMESTAMP)
 	`
+	query = d.db.Rebind(query)
 	_, err := d.db.ExecContext(ctx, query, partyID, stepIndex, bossName)
 	return err
 }
