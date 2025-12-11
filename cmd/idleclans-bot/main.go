@@ -128,9 +128,8 @@ func main() {
 		// Get database connection string from environment
 		dbURL := os.Getenv("DATABASE_URL")
 		if dbURL == "" {
-			// Fallback to SQLite for backward compatibility
-			sqlitePath := getEnvString("SQLITE_DB_PATH", "quests.db")
-			dbURL = "sqlite://" + sqlitePath
+			l.Error("DATABASE_URL environment variable is required")
+			os.Exit(1)
 		}
 		
 		// Create database connection for web server

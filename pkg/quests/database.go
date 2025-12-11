@@ -10,44 +10,27 @@ import (
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
-	_ "github.com/mattn/go-sqlite3"
 	"go.uber.org/zap"
 )
 
 type DB struct {
-	db     *sqlx.DB
-	driver string // "sqlite3" or "postgres"
+	db *sqlx.DB
 }
 
-// NewDB creates a new database connection. It accepts a connection string that can be:
-// - PostgreSQL: "postgres://..." or "postgresql://..."
-// - SQLite: "sqlite://path/to/file.db" or "file:path/to/file.db" or just a file path
+// NewDB creates a new PostgreSQL database connection.
+// It accepts a PostgreSQL connection string: "postgres://..." or "postgresql://..."
 func NewDB(connectionString string) (*DB, error) {
-	var driver string
-	var connStr string
-
-	// Detect database type from connection string
-	if strings.HasPrefix(connectionString, "postgres://") || strings.HasPrefix(connectionString, "postgresql://") {
-		driver = "postgres"
-		connStr = connectionString
-	} else if strings.HasPrefix(connectionString, "sqlite://") {
-		driver = "sqlite3"
-		connStr = strings.TrimPrefix(connectionString, "sqlite://")
-	} else if strings.HasPrefix(connectionString, "file:") {
-		driver = "sqlite3"
-		connStr = connectionString
-	} else {
-		// Default to SQLite for backward compatibility
-		driver = "sqlite3"
-		connStr = connectionString
+	// Validate that it's a PostgreSQL connection string
+	if !strings.HasPrefix(connectionString, "postgres://") && !strings.HasPrefix(connectionString, "postgresql://") {
+		return nil, fmt.Errorf("only PostgreSQL connection strings are supported (postgres:// or postgresql://)")
 	}
 
-	db, err := sqlx.Open(driver, connStr)
+	db, err := sqlx.Open("postgres", connectionString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	d := &DB{db: db, driver: driver}
+	d := &DB{db: db}
 	if err := d.initSchema(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
@@ -61,12 +44,7 @@ func (d *DB) Close() error {
 }
 
 func (d *DB) initSchema() error {
-	var schema string
-	if d.driver == "postgres" {
-		schema = d.getPostgreSQLSchema()
-	} else {
-		schema = d.getSQLiteSchema()
-	}
+	schema := d.getPostgreSQLSchema()
 
 	_, err := d.db.Exec(schema)
 	if err != nil {
@@ -75,136 +53,25 @@ func (d *DB) initSchema() error {
 
 	// Migration: Add max_required_kills column if it doesn't exist
 	// This handles existing databases that were created before this column was added
-	// SQLite's ALTER TABLE ADD COLUMN will fail if column exists, so we ignore that error
-	_, _ = d.db.Exec(`ALTER TABLE weekly_quests ADD COLUMN max_required_kills INTEGER`)
+	_, _ = d.db.Exec(`ALTER TABLE weekly_quests ADD COLUMN IF NOT EXISTS max_required_kills INTEGER`)
 
 	// Update existing rows to set max_required_kills = required_kills if it's NULL
 	// This handles both new columns (which will be NULL) and ensures consistency
 	_, _ = d.db.Exec(`UPDATE weekly_quests SET max_required_kills = required_kills WHERE max_required_kills IS NULL`)
 
-	// Migration: Fix unique constraint to include player_name (allows separate quests for main and alts)
-	// SQLite doesn't support dropping constraints, so we need to recreate the table
-	if err := d.migrateWeeklyQuestsUniqueConstraint(); err != nil {
-		// Log but don't fail - migration errors shouldn't prevent startup
-		fmt.Printf("Warning: Failed to migrate weekly_quests unique constraint: %v\n", err)
-	}
-
 	// Migration: Convert player_keys from discord_user_id to player_name
 	// Check if old schema exists (has discord_user_id column)
-	var hasOldSchema bool
 	var count int
-	
-	if d.driver == "postgres" {
-		row := d.db.QueryRow(`SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'player_keys' AND column_name = 'discord_user_id'`)
-		err = row.Scan(&count)
-	} else {
-		row := d.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('player_keys') WHERE name='discord_user_id'`)
-		err = row.Scan(&count)
-	}
-	
-	if err == nil && count > 0 {
-		hasOldSchema = true
-	}
+	row := d.db.QueryRow(`SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'player_keys' AND column_name = 'discord_user_id'`)
+	err = row.Scan(&count)
 
-	if hasOldSchema {
+	if err == nil && count > 0 {
 		if err := d.migratePlayerKeysToPlayerName(); err != nil {
 			return fmt.Errorf("failed to migrate player_keys: %w", err)
 		}
 	}
 
 	return nil
-}
-
-func (d *DB) getSQLiteSchema() string {
-	return `
-	CREATE TABLE IF NOT EXISTS players (
-		discord_user_id TEXT PRIMARY KEY,
-		player_name TEXT NOT NULL,
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);
-
-	CREATE TABLE IF NOT EXISTS weekly_quests (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		discord_user_id TEXT NOT NULL,
-		player_name TEXT NOT NULL,
-		week_number INTEGER NOT NULL,
-		year INTEGER NOT NULL,
-		boss_name TEXT NOT NULL,
-		required_kills INTEGER NOT NULL,
-		max_required_kills INTEGER NOT NULL,
-		current_kills INTEGER DEFAULT 0,
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		UNIQUE(discord_user_id, player_name, week_number, year, boss_name)
-	);
-
-	CREATE TABLE IF NOT EXISTS quest_kills (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		quest_id INTEGER NOT NULL,
-		kills_completed INTEGER NOT NULL,
-		recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		FOREIGN KEY(quest_id) REFERENCES weekly_quests(id)
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_weekly_quests_user_week ON weekly_quests(discord_user_id, week_number, year);
-	CREATE INDEX IF NOT EXISTS idx_weekly_quests_player_week ON weekly_quests(player_name, week_number, year);
-	CREATE INDEX IF NOT EXISTS idx_quest_kills_quest_id ON quest_kills(quest_id);
-	
-	CREATE TABLE IF NOT EXISTS player_keys (
-		player_name TEXT NOT NULL,
-		key_type TEXT NOT NULL,
-		count INTEGER NOT NULL DEFAULT 0,
-		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		PRIMARY KEY (player_name, key_type)
-	);
-
-	CREATE TABLE IF NOT EXISTS player_alts (
-		discord_user_id TEXT NOT NULL,
-		player_name TEXT NOT NULL,
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		PRIMARY KEY (discord_user_id, player_name)
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_player_alts_user ON player_alts(discord_user_id);
-
-	CREATE TABLE IF NOT EXISTS web_sessions (
-		session_id TEXT PRIMARY KEY,
-		user_id TEXT NOT NULL,
-		username TEXT NOT NULL,
-		avatar TEXT,
-		expires_at TIMESTAMP NOT NULL,
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_web_sessions_user ON web_sessions(user_id);
-	CREATE INDEX IF NOT EXISTS idx_web_sessions_expires ON web_sessions(expires_at);
-
-	CREATE TABLE IF NOT EXISTS parties (
-		id TEXT PRIMARY KEY,
-		players TEXT NOT NULL,
-		plan_data TEXT NOT NULL,
-		current_step_index INTEGER DEFAULT 0,
-		started_at TIMESTAMP,
-		ended_at TIMESTAMP,
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);
-
-	CREATE TABLE IF NOT EXISTS party_step_progress (
-		party_id TEXT NOT NULL,
-		step_index INTEGER NOT NULL,
-		boss_name TEXT NOT NULL,
-		kills_tracked INTEGER DEFAULT 0,
-		keys_used INTEGER DEFAULT 0,
-		started_at TIMESTAMP,
-		completed_at TIMESTAMP,
-		PRIMARY KEY (party_id, step_index),
-		FOREIGN KEY (party_id) REFERENCES parties(id)
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_parties_created ON parties(created_at);
-	CREATE INDEX IF NOT EXISTS idx_party_step_progress_party ON party_step_progress(party_id);
-	`
 }
 
 func (d *DB) getPostgreSQLSchema() string {
@@ -299,109 +166,6 @@ func (d *DB) getPostgreSQLSchema() string {
 	`
 }
 
-// migrateWeeklyQuestsUniqueConstraint migrates the weekly_quests table to include player_name in unique constraint
-// This migration only applies to SQLite databases
-func (d *DB) migrateWeeklyQuestsUniqueConstraint() error {
-	// This migration only applies to SQLite
-	if d.driver == "postgres" {
-		return nil
-	}
-	
-	// Check if migration is needed by checking if the old constraint exists
-	// We can detect this by checking if there are any duplicate player_name entries for same discord_user_id/boss/week/year
-	// But simpler: just check if table exists and try to create the new constraint index
-	// If it fails due to duplicates, we need to clean up first
-	
-	// First, try to create the new unique index
-	_, err := d.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_weekly_quests_unique_new ON weekly_quests(discord_user_id, player_name, week_number, year, boss_name)`)
-	if err != nil {
-		// If this fails, there might be duplicates - we need to handle them
-		// For now, just return the error - the old constraint will still work
-		return fmt.Errorf("failed to create new unique index (may have duplicates): %w", err)
-	}
-
-	// Check if we have the old constraint by trying to insert a test (we'll rollback)
-	// Actually, simpler: just recreate the table if we detect conflicts
-	// But that's risky. Let's try a different approach:
-	// Create a new table, copy data, then swap
-	
-	// Check if old table has the constraint by checking schema
-	var oldConstraintExists bool
-	row := d.db.QueryRow(`
-		SELECT sql FROM sqlite_master 
-		WHERE type='table' AND name='weekly_quests'
-	`)
-	var tableSQL string
-	if err := row.Scan(&tableSQL); err == nil {
-		// Check if the SQL contains the old constraint (without player_name)
-		if strings.Contains(tableSQL, "UNIQUE(discord_user_id, week_number, year, boss_name)") {
-			oldConstraintExists = true
-		}
-	}
-
-	if !oldConstraintExists {
-		// Already migrated or new database
-		return nil
-	}
-
-	// Need to recreate table - create new one with correct constraint
-	_, err = d.db.Exec(`
-		CREATE TABLE IF NOT EXISTS weekly_quests_new (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			discord_user_id TEXT NOT NULL,
-			player_name TEXT NOT NULL,
-			week_number INTEGER NOT NULL,
-			year INTEGER NOT NULL,
-			boss_name TEXT NOT NULL,
-			required_kills INTEGER NOT NULL,
-			max_required_kills INTEGER NOT NULL,
-			current_kills INTEGER DEFAULT 0,
-			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			UNIQUE(discord_user_id, player_name, week_number, year, boss_name)
-		)
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create new table: %w", err)
-	}
-
-	// Copy all data - the old constraint prevented duplicates, so this should be safe
-	_, err = d.db.Exec(`
-		INSERT INTO weekly_quests_new 
-		(id, discord_user_id, player_name, week_number, year, boss_name, required_kills, max_required_kills, current_kills, created_at, updated_at)
-		SELECT 
-			id, discord_user_id, player_name, week_number, year, boss_name, 
-			required_kills, max_required_kills, current_kills, created_at, updated_at
-		FROM weekly_quests
-	`)
-	if err != nil {
-		// Cleanup on failure
-		d.db.Exec(`DROP TABLE IF EXISTS weekly_quests_new`)
-		return fmt.Errorf("failed to copy data: %w", err)
-	}
-
-	// Update quest_kills foreign keys to point to new IDs (they should match)
-	// Actually, IDs should be preserved, so foreign keys should still work
-
-	// Drop old table
-	_, err = d.db.Exec(`DROP TABLE weekly_quests`)
-	if err != nil {
-		return fmt.Errorf("failed to drop old table: %w", err)
-	}
-
-	// Rename new table
-	_, err = d.db.Exec(`ALTER TABLE weekly_quests_new RENAME TO weekly_quests`)
-	if err != nil {
-		return fmt.Errorf("failed to rename table: %w", err)
-	}
-
-	// Recreate indexes
-	_, _ = d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_weekly_quests_user_week ON weekly_quests(discord_user_id, week_number, year)`)
-	_, _ = d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_weekly_quests_player_week ON weekly_quests(player_name, week_number, year)`)
-
-	return nil
-}
-
 // migratePlayerKeysToPlayerName migrates the player_keys table from discord_user_id to player_name
 // It handles orphaned records by logging warnings and skipping them (they would be unresolvable anyway)
 func (d *DB) migratePlayerKeysToPlayerName() error {
@@ -449,23 +213,13 @@ func (d *DB) migratePlayerKeysToPlayerName() error {
 
 	// Copy data from old table, joining with players to get player_name
 	// Using INNER JOIN intentionally - orphaned records are logged above and cannot be migrated
-	var insertQuery string
-	if d.driver == "postgres" {
-		insertQuery = `
-			INSERT INTO player_keys_new (player_name, key_type, count, updated_at)
-			SELECT p.player_name, pk.key_type, pk.count, pk.updated_at
-			FROM player_keys pk
-			JOIN players p ON pk.discord_user_id = p.discord_user_id
-			ON CONFLICT (player_name, key_type) DO NOTHING
-		`
-	} else {
-		insertQuery = `
-			INSERT OR IGNORE INTO player_keys_new (player_name, key_type, count, updated_at)
-			SELECT p.player_name, pk.key_type, pk.count, pk.updated_at
-			FROM player_keys pk
-			JOIN players p ON pk.discord_user_id = p.discord_user_id
-		`
-	}
+	insertQuery := `
+		INSERT INTO player_keys_new (player_name, key_type, count, updated_at)
+		SELECT p.player_name, pk.key_type, pk.count, pk.updated_at
+		FROM player_keys pk
+		JOIN players p ON pk.discord_user_id = p.discord_user_id
+		ON CONFLICT (player_name, key_type) DO NOTHING
+	`
 	result, err := d.db.Exec(insertQuery)
 	if err != nil {
 		// Cleanup on failure
@@ -1038,6 +792,7 @@ func (d *DB) RemoveAlt(ctx context.Context, discordUserID, playerName string) er
 	l.Info("Removing alt", zap.String("discord_user_id", discordUserID), zap.String("player_name", playerName))
 
 	query := `DELETE FROM player_alts WHERE discord_user_id = ? AND player_name = ?`
+	query = d.db.Rebind(query)
 	_, err := d.db.ExecContext(ctx, query, discordUserID, playerName)
 	return err
 }
@@ -1217,8 +972,8 @@ func (d *DB) CleanupExpiredSessions(ctx context.Context) error {
 // PartySession represents a party session
 type PartySession struct {
 	ID               string     `db:"id" json:"id"`
-	Players          string     `db:"players" json:"players"`               // JSON array of player names
-	PlanData         string     `db:"plan_data" json:"plan_data"`           // JSON of the generated plan
+	Players          string     `db:"players" json:"players"`     // JSON array of player names
+	PlanData         string     `db:"plan_data" json:"plan_data"` // JSON of the generated plan
 	CurrentStepIndex int        `db:"current_step_index" json:"current_step_index"`
 	StartedAt        *time.Time `db:"started_at" json:"started_at"`
 	EndedAt          *time.Time `db:"ended_at" json:"ended_at"`
@@ -1227,13 +982,13 @@ type PartySession struct {
 
 // PartyStepProgress represents progress for a single step in a party
 type PartyStepProgress struct {
-	PartyID     string     `db:"party_id" json:"party_id"`
-	StepIndex   int        `db:"step_index" json:"step_index"`
-	BossName    string     `db:"boss_name" json:"boss_name"`
-	KillsTracked int       `db:"kills_tracked" json:"kills_tracked"`
-	KeysUsed    int        `db:"keys_used" json:"keys_used"`
-	StartedAt   *time.Time `db:"started_at" json:"started_at"`
-	CompletedAt *time.Time `db:"completed_at" json:"completed_at"`
+	PartyID      string     `db:"party_id" json:"party_id"`
+	StepIndex    int        `db:"step_index" json:"step_index"`
+	BossName     string     `db:"boss_name" json:"boss_name"`
+	KillsTracked int        `db:"kills_tracked" json:"kills_tracked"`
+	KeysUsed     int        `db:"keys_used" json:"keys_used"`
+	StartedAt    *time.Time `db:"started_at" json:"started_at"`
+	CompletedAt  *time.Time `db:"completed_at" json:"completed_at"`
 }
 
 // CreateParty creates a new party session
@@ -1276,25 +1031,17 @@ func (d *DB) GetPartiesForUser(ctx context.Context, discordUserID string, limit 
 		return []PartySession{}, nil
 	}
 
-	// Use database-specific JSON functions to check if the players array contains any of our player names
+	// Use PostgreSQL JSON functions to check if the players array contains any of our player names
 	var conditions []string
 	var args []interface{}
-	
+
 	for _, name := range playerNames {
-		if d.driver == "postgres" {
-			// PostgreSQL: use jsonb_array_elements_text
-			// Use ? and let sqlx convert it to $1, $2, etc.
-			conditions = append(conditions, `EXISTS (
-				SELECT 1 FROM jsonb_array_elements_text(parties.players::jsonb) AS value
-				WHERE value = ?
-			)`)
-		} else {
-			// SQLite: use json_each
-			conditions = append(conditions, `EXISTS (
-				SELECT 1 FROM json_each(parties.players) 
-				WHERE json_each.value = ?
-			)`)
-		}
+		// PostgreSQL: use jsonb_array_elements_text
+		// Use ? and let sqlx convert it to $1, $2, etc.
+		conditions = append(conditions, `EXISTS (
+			SELECT 1 FROM jsonb_array_elements_text(parties.players::jsonb) AS value
+			WHERE value = ?
+		)`)
 		args = append(args, name)
 	}
 
@@ -1310,7 +1057,7 @@ func (d *DB) GetPartiesForUser(ctx context.Context, discordUserID string, limit 
 		LIMIT ?
 	`, whereClause)
 	args = append(args, limit)
-	
+
 	// Rebind query for the specific database driver
 	query = d.db.Rebind(query)
 
