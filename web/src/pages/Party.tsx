@@ -52,6 +52,7 @@ export function Party() {
   const [showEndConfirm, setShowEndConfirm] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
   const [conflictError, setConflictError] = useState<string | null>(null);
+  const [selectedTaskIndex, setSelectedTaskIndex] = useState<number | null>(null);
 
   // Timer state
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -134,16 +135,29 @@ export function Party() {
 
   // Timer effect
   useEffect(() => {
-    if (!party?.started_at || party.ended_at) {
+    if (!party?.started_at) {
       if (timerRef.current) {
         clearInterval(timerRef.current);
         timerRef.current = null;
       }
+      setElapsedSeconds(0);
       return;
     }
 
     const startTime = new Date(party.started_at).getTime();
 
+    // If party is ended, calculate final elapsed time
+    if (party.ended_at) {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      const endTime = new Date(party.ended_at).getTime();
+      setElapsedSeconds(Math.floor((endTime - startTime) / 1000));
+      return;
+    }
+
+    // Party is active, update timer continuously
     const updateTimer = () => {
       const now = Date.now();
       setElapsedSeconds(Math.floor((now - startTime) / 1000));
@@ -734,16 +748,30 @@ export function Party() {
                 index > 0 &&
                 allTasks[index - 1]?.key_holder !== task.key_holder &&
                 task.key_holder !== '';
+              const isSelected = isEnded && selectedTaskIndex === index;
 
               return (
                 <div
                   key={index}
+                  onClick={() => {
+                    if (isEnded) {
+                      setSelectedTaskIndex(isSelected ? null : index);
+                    }
+                  }}
                   className={`flex items-center gap-3 px-3 py-2 rounded-lg transition-all ${
-                    isCurrent
+                    isCurrent && !isEnded
                       ? 'bg-violet-900/30 border border-violet-500'
                       : isCompleted
                       ? 'bg-[var(--color-bg-dark)] opacity-60'
                       : 'bg-[var(--color-bg-dark)]'
+                  } ${
+                    isEnded
+                      ? 'cursor-pointer hover:bg-[var(--color-bg-input)] hover:opacity-100'
+                      : ''
+                  } ${
+                    isSelected
+                      ? 'ring-2 ring-violet-500 bg-violet-900/30 opacity-100'
+                      : ''
                   }`}
                 >
                   {/* Step indicator */}
@@ -767,7 +795,7 @@ export function Party() {
                   <div className="flex-1">
                     <span
                       className={`font-medium ${
-                        isCurrent ? 'text-white' : 'text-gray-300'
+                        isCurrent || isSelected ? 'text-white' : 'text-gray-300'
                       }`}
                     >
                       {info?.label || task.boss_name}
@@ -805,6 +833,90 @@ export function Party() {
             )}
           </div>
         </div>
+
+        {/* Task Details View (when party is ended and task is selected) */}
+        {isEnded && selectedTaskIndex !== null && allTasks[selectedTaskIndex] && (
+          <div className="bg-[var(--color-bg-card)] rounded-xl border border-[var(--color-border)] overflow-hidden">
+            <div
+              className="px-6 py-4 border-b border-[var(--color-border)]"
+              style={{
+                background: `linear-gradient(135deg, ${getBossInfo(allTasks[selectedTaskIndex].boss_name)?.color || '#888'}22, transparent)`,
+              }}
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                  <div
+                    className="w-16 h-16 rounded-xl flex items-center justify-center text-3xl font-bold text-white"
+                    style={{ backgroundColor: getBossInfo(allTasks[selectedTaskIndex].boss_name)?.color || '#888' }}
+                  >
+                    {(getBossInfo(allTasks[selectedTaskIndex].boss_name)?.label || allTasks[selectedTaskIndex].boss_name)[0].toUpperCase()}
+                  </div>
+                  <div>
+                    <h3 className="text-xl font-bold text-white">
+                      Step {selectedTaskIndex + 1}: {getBossInfo(allTasks[selectedTaskIndex].boss_name)?.label || allTasks[selectedTaskIndex].boss_name}
+                    </h3>
+                    <p className="text-sm text-gray-400">
+                      {allTasks[selectedTaskIndex].key_holder
+                        ? `Keys: ${allTasks[selectedTaskIndex].key_holder}`
+                        : 'No keys assigned'}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setSelectedTaskIndex(null)}
+                  className="px-4 py-2 text-sm text-gray-400 hover:text-white border border-gray-600 hover:border-gray-500 rounded-lg transition-colors"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+            <div className="p-6 space-y-4">
+              <div className="grid grid-cols-2 gap-4">
+                <div className="bg-[var(--color-bg-dark)] rounded-lg p-4">
+                  <div className="text-xs text-gray-500 mb-1">Required Kills</div>
+                  <div className="text-2xl font-mono font-bold text-white">
+                    {allTasks[selectedTaskIndex].kills}
+                  </div>
+                </div>
+                <div className="bg-[var(--color-bg-dark)] rounded-lg p-4">
+                  <div className="text-xs text-gray-500 mb-1">Kills Tracked</div>
+                  <div className="text-2xl font-mono font-bold text-amber-400">
+                    {party.step_progress.find((p) => p.step_index === selectedTaskIndex)?.kills_tracked || 0}
+                  </div>
+                </div>
+              </div>
+              {party.step_progress.find((p) => p.step_index === selectedTaskIndex) && (
+                <>
+                  {party.step_progress.find((p) => p.step_index === selectedTaskIndex)?.keys_used !== undefined && 
+                   (party.step_progress.find((p) => p.step_index === selectedTaskIndex)?.keys_used || 0) > 0 && (
+                    <div className="bg-[var(--color-bg-dark)] rounded-lg p-4">
+                      <div className="text-xs text-gray-500 mb-1">Keys Used</div>
+                      <div className="text-xl font-mono font-bold text-white">
+                        {party.step_progress.find((p) => p.step_index === selectedTaskIndex)?.keys_used || 0}
+                      </div>
+                    </div>
+                  )}
+                  {party.step_progress.find((p) => p.step_index === selectedTaskIndex)?.started_at && (
+                    <div className="bg-[var(--color-bg-dark)] rounded-lg p-4">
+                      <div className="text-xs text-gray-500 mb-1">Started At</div>
+                      <div className="text-sm text-white">
+                        {new Date(party.step_progress.find((p) => p.step_index === selectedTaskIndex)!.started_at!).toLocaleString()}
+                      </div>
+                    </div>
+                  )}
+                  {party.step_progress.find((p) => p.step_index === selectedTaskIndex)?.completed_at && (
+                    <div className="bg-[var(--color-bg-dark)] rounded-lg p-4">
+                      <div className="text-xs text-gray-500 mb-1">Completed At</div>
+                      <div className="text-sm text-white">
+                        {new Date(party.step_progress.find((p) => p.step_index === selectedTaskIndex)!.completed_at!).toLocaleString()}
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* End Party Button */}
         {isStarted && !isEnded && (
