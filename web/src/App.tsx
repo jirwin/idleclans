@@ -4,6 +4,7 @@ import { Dashboard } from './pages/Dashboard';
 import { Clan } from './pages/Clan';
 import { Party } from './pages/Party';
 import { Admin } from './pages/Admin';
+import { Market } from './pages/Market';
 
 // Declare the global admin mode flag injected by the server
 declare global {
@@ -34,6 +35,7 @@ function App() {
         <Route path="/dashboard" element={<Dashboard />} />
         <Route path="/clan" element={<Clan />} />
         <Route path="/party/:partyId" element={<Party />} />
+        <Route path="/market" element={<Market />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </BrowserRouter>

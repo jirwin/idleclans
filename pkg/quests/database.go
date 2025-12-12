@@ -43,6 +43,11 @@ func (d *DB) Close() error {
 	return d.db.Close()
 }
 
+// GetDB returns the underlying sqlx.DB connection for sharing with other packages
+func (d *DB) GetDB() *sqlx.DB {
+	return d.db
+}
+
 func (d *DB) initSchema() error {
 	schema := d.getPostgreSQLSchema()
 

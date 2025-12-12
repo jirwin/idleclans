@@ -48,7 +48,7 @@ func (h *questsHandler) close() error {
 func (p *plugin) questsCmd(ctx context.Context) bot.MessageHandler {
 	return func(s *discordgo.Session, m *discordgo.MessageCreate) {
 		if p.questsHandler == nil {
-			s.ChannelMessageSend(m.ChannelID, "Error: Quest system unavailable")
+			//s.ChannelMessageSend(m.ChannelID, "Error: Quest system unavailable")
 			return
 		}
 		if m.Author.ID == s.State.User.ID {

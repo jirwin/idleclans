@@ -124,6 +124,9 @@ func main() {
 	discordClientID := getCredential("discord_client_id", "DISCORD_CLIENT_ID")
 	discordClientSecret := getCredential("discord_client_secret", "DISCORD_CLIENT_SECRET")
 
+	// Track if market is enabled for later initialization
+	var enableMarket bool
+
 	if discordClientID != "" && discordClientSecret != "" {
 		// Get database connection string from environment
 		dbURL := os.Getenv("DATABASE_URL")
@@ -140,6 +143,8 @@ func main() {
 		}
 		defer webDB.Close()
 
+		enableMarket = os.Getenv("ENABLE_MARKET") == "true" || os.Getenv("ENABLE_MARKET") == "1"
+
 		webConfig := &web.Config{
 			PublicPort:          getEnvInt("WEB_PUBLIC_PORT", 8080),
 			AdminPort:           getEnvInt("WEB_ADMIN_PORT", 8081),
@@ -151,6 +156,7 @@ func main() {
 			DiscordChannelID:    os.Getenv("DISCORD_CHANNEL_ID"),
 			OpenAIAPIKey:        getCredential("openai_api_key", "OPENAI_API_KEY"),
 			OpenAIModel:         getEnvString("OPENAI_MODEL", "gpt-4o"),
+			EnableMarket:        enableMarket,
 		}
 
 		if webConfig.BaseURL == "" {
@@ -163,16 +169,26 @@ func main() {
 			os.Exit(1)
 		}
 
+		// Start HTTP server FIRST - so nginx can connect immediately
+		// Heavy initialization (market, discord) happens after
 		if err := webServer.Start(ctx); err != nil {
 			l.Error("Failed to start web server", zap.Error(err))
 			os.Exit(1)
 		}
 
-		l.Info("Web server started",
+		l.Info("Web server started (health check available)",
 			zap.Int("public_port", webConfig.PublicPort),
 			zap.Int("admin_port", webConfig.AdminPort),
-			zap.String("required_guild", webConfig.RequiredGuild),
 		)
+
+		// Initialize market tracking if enabled (this can be slow, but server is already listening)
+		if enableMarket {
+			if err := webServer.InitMarket(ctx); err != nil {
+				l.Error("Failed to initialize market tracking", zap.Error(err))
+				os.Exit(1)
+			}
+			l.Info("Market tracking initialized")
+		}
 	} else {
 		l.Info("Web server disabled (DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET not set)")
 	}
@@ -212,6 +228,12 @@ func main() {
 	if webServer != nil {
 		webServer.SetDiscordSender(&botAdapter{bot: b})
 		l.Info("Connected Discord message sender to web server")
+
+		// Start market collector now that everything is initialized
+		if enableMarket {
+			webServer.StartMarketCollector(ctx)
+			l.Info("Market price collector started")
+		}
 	}
 
 	l.Info("Bot is now running. Press CTRL+C to exit.")
@@ -223,6 +245,9 @@ func main() {
 	l.Info("Shutting down...")
 
 	if webServer != nil {
+		// Stop market collector first
+		webServer.StopMarketCollector()
+
 		if err := webServer.Stop(ctx); err != nil {
 			l.Error("Error stopping web server", zap.Error(err))
 		}

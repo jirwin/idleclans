@@ -536,3 +536,276 @@ export async function endParty(partyId: string): Promise<void> {
   }
 }
 
+// Market API functions
+
+export interface MarketItem {
+  id: number;
+  name_id: string;
+  display_name: string;
+  category: string;
+  lowest_sell_price: number;
+  lowest_price_volume: number;
+  highest_buy_price: number;
+  highest_price_volume: number;
+  spread: number;
+  spread_percent: number;
+  last_updated: string;
+}
+
+export interface PriceSnapshot {
+  time: string;
+  item_id: number;
+  lowest_sell_price: number;
+  lowest_price_volume: number;
+  highest_buy_price: number;
+  highest_price_volume: number;
+}
+
+export interface PriceChange24h {
+  previous_price: number;
+  current_price: number;
+  change: number;
+  change_percent: number;
+}
+
+export interface ItemSummary {
+  item: MarketItem;
+  current_price: PriceSnapshot | null;
+  change_24h: PriceChange24h | null;
+  volatility: number;
+  spread: number;
+  spread_percent: number;
+}
+
+export interface PriceChange {
+  item_id: number;
+  name_id: string;
+  display_name: string;
+  current_price: number;
+  previous_price: number;
+  price_change: number;
+  change_percent: number;
+  volume: number;
+}
+
+export interface MarketOverview {
+  total_items: number;
+  active_items: number;
+  top_gainers: PriceChange[];
+  top_losers: PriceChange[];
+  most_traded: PriceChange[];
+  last_updated: string;
+}
+
+export interface OHLC {
+  time: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export interface PriceHistoryResponse {
+  item: MarketItem;
+  history: PriceSnapshot[];
+  ohlc?: OHLC[];
+}
+
+export interface DailyAggregate {
+  date: string;
+  item_id: number;
+  open_price: number;
+  high_price: number;
+  low_price: number;
+  close_price: number;
+  avg_price: number;
+  total_sell_volume: number;
+  total_buy_volume: number;
+  sample_count: number;
+}
+
+export interface SpreadAnalysis {
+  current_spread: number;
+  current_spread_pct: number;
+  avg_spread_24h: number;
+  min_spread_24h: number;
+  max_spread_24h: number;
+  spread_volatility: number;
+}
+
+export interface VolumeAnalysis {
+  current_sell_volume: number;
+  current_buy_volume: number;
+  avg_volume_24h: number;
+  volume_change: number;
+  is_high_volume: boolean;
+}
+
+export interface CollectorStats {
+  last_collection_time: string;
+  last_collection_count: string;
+  total_items: number;
+  total_snapshots: number;
+  collection_interval: string;
+}
+
+const MARKET_API_BASE = '/api/market';
+
+export async function fetchMarketOverview(): Promise<MarketOverview> {
+  const res = await fetch(`${MARKET_API_BASE}/overview`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch market overview: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function fetchMarketStats(): Promise<CollectorStats> {
+  const res = await fetch(`${MARKET_API_BASE}/stats`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch market stats: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function searchMarketItems(query: string, limit = 20): Promise<MarketItem[]> {
+  const res = await fetch(`${MARKET_API_BASE}/items/search?q=${encodeURIComponent(query)}&limit=${limit}`);
+  if (!res.ok) {
+    throw new Error(`Failed to search items: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export interface PaginatedMarketItems {
+  items: MarketItem[];
+  total: number;
+}
+
+export async function fetchAllMarketItems(): Promise<MarketItem[]> {
+  const res = await fetch(`${MARKET_API_BASE}/items`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch items: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function fetchMarketItemsPaginated(page: number, limit: number): Promise<PaginatedMarketItems> {
+  const res = await fetch(`${MARKET_API_BASE}/items?page=${page}&limit=${limit}`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch items: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function fetchMarketItem(itemId: number): Promise<ItemSummary> {
+  const res = await fetch(`${MARKET_API_BASE}/items/${itemId}`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch item: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function fetchMarketItemByName(nameId: string): Promise<ItemSummary> {
+  const res = await fetch(`${MARKET_API_BASE}/item-by-name/${encodeURIComponent(nameId)}`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch item: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function fetchPriceHistory(
+  itemId: number,
+  options?: {
+    from?: string;
+    to?: string;
+    limit?: number;
+    interval?: number;
+    ohlc?: boolean;
+  }
+): Promise<PriceHistoryResponse> {
+  const params = new URLSearchParams();
+  if (options?.from) params.set('from', options.from);
+  if (options?.to) params.set('to', options.to);
+  if (options?.limit) params.set('limit', options.limit.toString());
+  if (options?.interval) params.set('interval', options.interval.toString());
+  if (options?.ohlc) params.set('ohlc', 'true');
+
+  const res = await fetch(`${MARKET_API_BASE}/items/${itemId}/history?${params}`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch price history: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function fetchDailyPrices(
+  itemId: number,
+  from?: string,
+  to?: string
+): Promise<{ item: MarketItem; daily: DailyAggregate[] }> {
+  const params = new URLSearchParams();
+  if (from) params.set('from', from);
+  if (to) params.set('to', to);
+
+  const res = await fetch(`${MARKET_API_BASE}/items/${itemId}/daily?${params}`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch daily prices: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function fetchOHLC(
+  itemId: number,
+  options?: {
+    from?: string;
+    to?: string;
+    interval?: number;
+  }
+): Promise<OHLC[]> {
+  const params = new URLSearchParams();
+  if (options?.from) params.set('from', options.from);
+  if (options?.to) params.set('to', options.to);
+  if (options?.interval) params.set('interval', options.interval.toString());
+
+  const res = await fetch(`${MARKET_API_BASE}/items/${itemId}/ohlc?${params}`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch OHLC data: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function fetchTopMovers(
+  type: 'gainers' | 'losers' = 'gainers',
+  hours = 24,
+  limit = 10
+): Promise<PriceChange[]> {
+  const res = await fetch(`${MARKET_API_BASE}/movers?type=${type}&hours=${hours}&limit=${limit}`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch top movers: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function fetchMostTraded(hours = 24, limit = 10): Promise<PriceChange[]> {
+  const res = await fetch(`${MARKET_API_BASE}/most-traded?hours=${hours}&limit=${limit}`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch most traded: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function fetchSpreadAnalysis(itemId: number): Promise<SpreadAnalysis> {
+  const res = await fetch(`${MARKET_API_BASE}/items/${itemId}/spread`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch spread analysis: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function fetchVolumeAnalysis(itemId: number): Promise<VolumeAnalysis> {
+  const res = await fetch(`${MARKET_API_BASE}/items/${itemId}/volume`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch volume analysis: ${res.statusText}`);
+  }
+  return res.json();
+}
+

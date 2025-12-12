@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jirwin/idleclans/pkg/idleclans"
+	"github.com/jirwin/idleclans/pkg/market"
 	"github.com/jirwin/idleclans/pkg/openai"
 	"github.com/jirwin/idleclans/pkg/quests"
 	"go.uber.org/zap"
@@ -24,6 +25,7 @@ type Config struct {
 	DiscordChannelID    string // Channel to send messages to
 	OpenAIAPIKey        string // OpenAI API key for image analysis
 	OpenAIModel         string // Vision model for image analysis (e.g., gpt-4o)
+	EnableMarket        bool   // Enable market price tracking
 }
 
 // DiscordEmbed represents a Discord embed for the web server
@@ -49,17 +51,22 @@ type DiscordMessageSender interface {
 
 // Server represents the web server
 type Server struct {
-	config            *Config
-	db                *quests.DB
-	logger            *zap.Logger
-	publicServer      *http.Server
-	adminServer       *http.Server
-	sessionStore      *SessionStore
-	sseBroker         *SSEBroker
-	icClient          *idleclans.Client
-	discordSender     DiscordMessageSender
-	openaiClient      *openai.Client
+	config             *Config
+	db                 *quests.DB
+	logger             *zap.Logger
+	publicServer       *http.Server
+	adminServer        *http.Server
+	publicMux          *http.ServeMux
+	sessionStore       *SessionStore
+	sseBroker          *SSEBroker
+	icClient           *idleclans.Client
+	discordSender      DiscordMessageSender
+	openaiClient       *openai.Client
 	keyReferenceImages *KeyReferenceImages
+	// Market components
+	marketDB        *market.DB
+	marketCollector *market.Collector
+	marketAPI       *MarketAPI
 }
 
 // SetDiscordSender sets the Discord message sender
@@ -98,15 +105,60 @@ func NewServer(config *Config, db *quests.DB, logger *zap.Logger) (*Server, erro
 	return s, nil
 }
 
+// InitMarket initializes the market tracking components
+// This should be called after NewServer and Start if market tracking is enabled
+func (s *Server) InitMarket(ctx context.Context) error {
+	if !s.config.EnableMarket {
+		return nil
+	}
+
+	// Create market DB using the same connection
+	var err error
+	s.marketDB, err = market.NewDB(s.db.GetDB(), s.logger)
+	if err != nil {
+		return fmt.Errorf("failed to initialize market database: %w", err)
+	}
+
+	// Create collector
+	s.marketCollector = market.NewCollector(s.marketDB, s.logger, nil)
+
+	// Create API handler
+	s.marketAPI = NewMarketAPI(s.marketDB, s.marketCollector, s.logger)
+
+	// Register market routes now that the API is initialized
+	// This is done after Start() so the server can respond to health checks immediately
+	if s.publicMux != nil {
+		s.marketAPI.RegisterRoutes(s.publicMux, "/api/market")
+		s.logger.Info("Market API routes registered")
+	}
+
+	s.logger.Info("Market tracking initialized")
+	return nil
+}
+
+// StartMarketCollector starts the background price collector
+func (s *Server) StartMarketCollector(ctx context.Context) {
+	if s.marketCollector != nil {
+		s.marketCollector.Start(ctx)
+	}
+}
+
+// StopMarketCollector stops the background price collector
+func (s *Server) StopMarketCollector() {
+	if s.marketCollector != nil {
+		s.marketCollector.Stop()
+	}
+}
+
 // Start starts both the public and admin HTTP servers
 func (s *Server) Start(ctx context.Context) error {
 	// Setup public server routes
-	publicMux := http.NewServeMux()
-	s.setupPublicRoutes(publicMux)
+	s.publicMux = http.NewServeMux()
+	s.setupPublicRoutes(s.publicMux)
 
 	s.publicServer = &http.Server{
 		Addr:         fmt.Sprintf(":%d", s.config.PublicPort),
-		Handler:      publicMux,
+		Handler:      s.publicMux,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -167,6 +219,10 @@ func (s *Server) Stop(ctx context.Context) error {
 }
 
 func (s *Server) setupPublicRoutes(mux *http.ServeMux) {
+	// Health check endpoint - responds immediately, useful for nginx/load balancers
+	mux.HandleFunc("GET /health", s.handleHealthCheck)
+	mux.HandleFunc("GET /api/health", s.handleHealthCheck)
+
 	// Auth routes
 	mux.HandleFunc("GET /api/auth/login", s.handleLogin)
 	mux.HandleFunc("GET /api/auth/callback", s.handleCallback)
@@ -204,11 +260,18 @@ func (s *Server) setupPublicRoutes(mux *http.ServeMux) {
 	// SSE endpoint for live updates
 	mux.HandleFunc("GET /api/events", s.handleSSE)
 
+	// Note: Market routes are registered dynamically after InitMarket() is called
+	// This allows the server to start quickly and respond to health checks
+	// before market initialization completes
+
 	// Serve static files for SPA
 	mux.HandleFunc("/", s.handleStaticFiles)
 }
 
 func (s *Server) setupAdminRoutes(mux *http.ServeMux) {
+	// Health check for admin port too
+	mux.HandleFunc("GET /health", s.handleHealthCheck)
+
 	// Admin API routes (no auth required - internal network only)
 	mux.HandleFunc("GET /api/admin/check", s.handleAdminCheck)
 	mux.HandleFunc("GET /api/players", s.handleAdminGetPlayers)
@@ -229,3 +292,9 @@ func (s *Server) setupAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/", s.handleAdminStaticFiles)
 }
 
+// handleHealthCheck provides a simple health check endpoint for load balancers/nginx
+func (s *Server) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"ok"}`))
+}
