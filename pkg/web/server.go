@@ -72,6 +72,118 @@ type Server struct {
 // SetDiscordSender sets the Discord message sender
 func (s *Server) SetDiscordSender(sender DiscordMessageSender) {
 	s.discordSender = sender
+
+	// Set up market watch notifier now that Discord is available
+	if s.marketCollector != nil && s.config.DiscordChannelID != "" {
+		watchNotifier := &MarketWatchNotifier{
+			sender:    sender,
+			channelID: s.config.DiscordChannelID,
+			baseURL:   s.config.BaseURL,
+			logger:    s.logger,
+		}
+		s.marketCollector.SetWatchNotifier(watchNotifier)
+		s.logger.Info("Market watch notifications enabled")
+	}
+
+	// Set up SSE data change notifier for market updates
+	if s.marketCollector != nil {
+		s.marketCollector.SetDataChangeNotifier(s.NotifyDataChange)
+		s.logger.Info("Market SSE notifications enabled")
+	}
+}
+
+// MarketWatchNotifier implements market.WatchNotifier to send Discord notifications
+type MarketWatchNotifier struct {
+	sender    DiscordMessageSender
+	channelID string
+	baseURL   string
+	logger    *zap.Logger
+}
+
+// NotifyWatchTriggered sends a Discord notification when a market watch triggers
+func (n *MarketWatchNotifier) NotifyWatchTriggered(ctx context.Context, watch *market.TriggeredWatch) error {
+	if n.sender == nil || n.channelID == "" {
+		return nil // No Discord configured
+	}
+
+	// Format the notification message
+	var typeDescription string
+	var priceDescription string
+	if watch.WatchType == "buy" {
+		typeDescription = "Buy price rose to"
+		priceDescription = fmt.Sprintf("Current buy price: **%s** (your threshold: %s)",
+			formatPrice(watch.CurrentPrice), formatPrice(watch.Threshold))
+	} else {
+		typeDescription = "Sell price dropped to"
+		priceDescription = fmt.Sprintf("Current sell price: **%s** (your threshold: %s)",
+			formatPrice(watch.CurrentPrice), formatPrice(watch.Threshold))
+	}
+
+	itemName := watch.ItemDisplayName
+	if itemName == "" {
+		itemName = watch.ItemNameID
+	}
+
+	// Create the ping content (mention the user)
+	pingContent := fmt.Sprintf("<@%s>", watch.UserID)
+
+	// Create the embed
+	embed := &DiscordEmbed{
+		Title:       "Market Watch Triggered!",
+		Description: fmt.Sprintf("%s **%s**\n%s", typeDescription, formatPrice(watch.CurrentPrice), priceDescription),
+		Color:       0x10B981, // Emerald green
+		Fields: []DiscordEmbedField{
+			{
+				Name:   "Item",
+				Value:  itemName,
+				Inline: true,
+			},
+			{
+				Name:   "Watch Type",
+				Value:  capitalizeFirst(watch.WatchType),
+				Inline: true,
+			},
+			{
+				Name:   "View Item",
+				Value:  fmt.Sprintf("[Open in Market](%s/market?item=%d)", n.baseURL, watch.ItemID),
+				Inline: false,
+			},
+		},
+	}
+
+	return n.sender.SendMessageWithEmbed(n.channelID, pingContent, embed)
+}
+
+// formatPrice formats a price with commas
+func formatPrice(price int) string {
+	if price == 0 {
+		return "0"
+	}
+
+	// Convert to string and add commas
+	str := fmt.Sprintf("%d", price)
+	n := len(str)
+	if n <= 3 {
+		return str
+	}
+
+	// Add commas every 3 digits from the right
+	var result []byte
+	for i, c := range str {
+		if i > 0 && (n-i)%3 == 0 {
+			result = append(result, ',')
+		}
+		result = append(result, byte(c))
+	}
+	return string(result)
+}
+
+// capitalizeFirst capitalizes the first letter of a string
+func capitalizeFirst(s string) string {
+	if s == "" {
+		return s
+	}
+	return string(s[0]-32) + s[1:]
 }
 
 // NewServer creates a new web server
@@ -122,13 +234,17 @@ func (s *Server) InitMarket(ctx context.Context) error {
 	// Create collector
 	s.marketCollector = market.NewCollector(s.marketDB, s.logger, nil)
 
+	// Note: Watch notifier is set up in SetDiscordSender() after Discord bot is connected
+
 	// Create API handler
 	s.marketAPI = NewMarketAPI(s.marketDB, s.marketCollector, s.logger)
+	s.marketAPI.SetDataChangeNotifier(s.NotifyDataChange)
 
 	// Register market routes now that the API is initialized
 	// This is done after Start() so the server can respond to health checks immediately
 	if s.publicMux != nil {
 		s.marketAPI.RegisterRoutes(s.publicMux, "/api/market")
+		s.marketAPI.RegisterAuthenticatedRoutes(s.publicMux, "/api/market", s.withAuth)
 		s.logger.Info("Market API routes registered")
 	}
 

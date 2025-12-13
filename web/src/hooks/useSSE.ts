@@ -1,7 +1,7 @@
 import { useEffect, useRef, useCallback } from 'react';
 
 interface UseSSEOptions {
-  onUpdate: () => void;
+  onUpdate: (eventType?: string) => void;
   enabled?: boolean;
 }
 
@@ -30,21 +30,31 @@ export function useSSE({ onUpdate, enabled = true }: UseSSEOptions) {
 
     eventSource.addEventListener('update', (event) => {
       console.log('SSE update:', event.data);
-      // Use the ref to always call the latest callback
-      onUpdateRef.current();
+      // Parse the event type from the data and pass it to the callback
+      try {
+        const data = JSON.parse(event.data);
+        onUpdateRef.current(data.type);
+      } catch {
+        onUpdateRef.current();
+      }
     });
 
     eventSource.onerror = () => {
-      console.log('SSE connection error, reconnecting...');
-      eventSource.close();
-      
-      // Reconnect after a delay
-      if (reconnectTimeoutRef.current) {
-        window.clearTimeout(reconnectTimeoutRef.current);
+      // Only log and reconnect if the connection was previously open
+      // readyState: 0 = CONNECTING, 1 = OPEN, 2 = CLOSED
+      if (eventSource.readyState === EventSource.CLOSED) {
+        console.log('SSE connection closed, reconnecting...');
+        eventSource.close();
+        
+        // Reconnect after a delay
+        if (reconnectTimeoutRef.current) {
+          window.clearTimeout(reconnectTimeoutRef.current);
+        }
+        reconnectTimeoutRef.current = window.setTimeout(() => {
+          connect();
+        }, 5000);
       }
-      reconnectTimeoutRef.current = window.setTimeout(() => {
-        connect();
-      }, 5000);
+      // If still CONNECTING, EventSource will retry automatically
     };
   }, [enabled]); // Removed onUpdate from dependencies
 

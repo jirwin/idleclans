@@ -52,7 +52,7 @@ export function Admin() {
 
   // Use SSE for live updates
   useSSE({
-    onUpdate: loadPlayers,
+    onUpdate: () => loadPlayers(),
     enabled: !loading && !accessDenied,
   });
 

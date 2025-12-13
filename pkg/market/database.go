@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	"go.uber.org/zap"
 )
 
@@ -179,6 +179,32 @@ func (d *DB) getBaseSchema() string {
 
 	-- Initialize the cache row if it doesn't exist
 	INSERT INTO market_overview_cache (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+	-- Market watches for price alerts
+	CREATE TABLE IF NOT EXISTS market_watches (
+		id SERIAL PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		item_id INTEGER NOT NULL REFERENCES market_items(id),
+		watch_type TEXT NOT NULL,
+		threshold INTEGER NOT NULL,
+		triggered BOOLEAN DEFAULT FALSE,
+		triggered_at TIMESTAMPTZ,
+		created_at TIMESTAMPTZ DEFAULT NOW(),
+		expires_at TIMESTAMPTZ
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_market_watches_user ON market_watches(user_id);
+	CREATE INDEX IF NOT EXISTS idx_market_watches_active ON market_watches(triggered, item_id) WHERE triggered = FALSE;
+
+	-- Trade volume cache from comprehensive API
+	CREATE TABLE IF NOT EXISTS market_trade_volume_cache (
+		item_id INTEGER PRIMARY KEY REFERENCES market_items(id),
+		trade_volume_1day INTEGER,
+		avg_price_1day INTEGER,
+		avg_price_7days INTEGER,
+		avg_price_30days INTEGER,
+		fetched_at TIMESTAMPTZ DEFAULT NOW()
+	);
 	`
 }
 
@@ -365,6 +391,16 @@ type PriceSnapshot struct {
 	LowestPriceVolume  int       `db:"lowest_price_volume" json:"lowest_price_volume"`
 	HighestBuyPrice    int       `db:"highest_buy_price" json:"highest_buy_price"`
 	HighestPriceVolume int       `db:"highest_price_volume" json:"highest_price_volume"`
+}
+
+// TradeVolumeCache caches trade volume data from the comprehensive API
+type TradeVolumeCache struct {
+	ItemID        int       `db:"item_id" json:"item_id"`
+	TradeVolume1d *int      `db:"trade_volume_1day" json:"trade_volume_1day,omitempty"`
+	AvgPrice1d    *int      `db:"avg_price_1day" json:"avg_price_1day,omitempty"`
+	AvgPrice7d    *int      `db:"avg_price_7days" json:"avg_price_7days,omitempty"`
+	AvgPrice30d   *int      `db:"avg_price_30days" json:"avg_price_30days,omitempty"`
+	FetchedAt     time.Time `db:"fetched_at" json:"fetched_at"`
 }
 
 // DailyAggregate represents daily price aggregates
@@ -943,7 +979,7 @@ func (d *DB) GetLatestPrices(ctx context.Context, itemIDs []int) ([]PriceSnapsho
 		ORDER BY item_id, time DESC
 	`
 	var snapshots []PriceSnapshot
-	err := d.db.SelectContext(ctx, &snapshots, query, itemIDs)
+	err := d.db.SelectContext(ctx, &snapshots, query, pq.Array(itemIDs))
 	return snapshots, err
 }
 
@@ -1375,4 +1411,171 @@ func (d *DB) GetMostTradedOptimized(ctx context.Context, limit int) ([]PriceChan
 
 	err := d.db.SelectContext(ctx, &results, wrapperQuery, limit)
 	return results, err
+}
+
+// Watch represents a market price watch/alert
+type Watch struct {
+	ID          int        `db:"id" json:"id"`
+	UserID      string     `db:"user_id" json:"user_id"`
+	ItemID      int        `db:"item_id" json:"item_id"`
+	WatchType   string     `db:"watch_type" json:"watch_type"` // "buy" or "sell"
+	Threshold   int        `db:"threshold" json:"threshold"`
+	Triggered   bool       `db:"triggered" json:"triggered"`
+	TriggeredAt *time.Time `db:"triggered_at" json:"triggered_at,omitempty"`
+	CreatedAt   time.Time  `db:"created_at" json:"created_at"`
+	ExpiresAt   *time.Time `db:"expires_at" json:"expires_at,omitempty"`
+}
+
+// WatchWithItem represents a watch with item details and current prices
+type WatchWithItem struct {
+	Watch
+	ItemNameID       string `db:"item_name_id" json:"item_name_id"`
+	ItemDisplayName  string `db:"item_display_name" json:"item_display_name"`
+	CurrentBuyPrice  int    `db:"current_buy_price" json:"current_buy_price"`
+	CurrentSellPrice int    `db:"current_sell_price" json:"current_sell_price"`
+}
+
+// CreateWatch creates a new market watch for a user
+func (d *DB) CreateWatch(ctx context.Context, userID string, itemID int, watchType string, threshold int) (*Watch, error) {
+	if watchType != "buy" && watchType != "sell" {
+		return nil, fmt.Errorf("invalid watch type: must be 'buy' or 'sell'")
+	}
+
+	query := `
+		INSERT INTO market_watches (user_id, item_id, watch_type, threshold, created_at)
+		VALUES ($1, $2, $3, $4, NOW())
+		RETURNING id, user_id, item_id, watch_type, threshold, triggered, triggered_at, created_at, expires_at
+	`
+	var watch Watch
+	err := d.db.GetContext(ctx, &watch, query, userID, itemID, watchType, threshold)
+	if err != nil {
+		return nil, err
+	}
+	return &watch, nil
+}
+
+// GetWatchesByUser retrieves all watches for a user with current prices
+func (d *DB) GetWatchesByUser(ctx context.Context, userID string) ([]WatchWithItem, error) {
+	query := `
+		WITH latest_prices AS (
+			SELECT DISTINCT ON (item_id)
+				item_id,
+				highest_buy_price,
+				lowest_sell_price
+			FROM market_prices
+			ORDER BY item_id, time DESC
+		)
+		SELECT 
+			w.id, w.user_id, w.item_id, w.watch_type, w.threshold, 
+			w.triggered, w.triggered_at, w.created_at, w.expires_at,
+			mi.name_id as item_name_id,
+			COALESCE(mi.display_name, mi.name_id) as item_display_name,
+			COALESCE(lp.highest_buy_price, 0) as current_buy_price,
+			COALESCE(lp.lowest_sell_price, 0) as current_sell_price
+		FROM market_watches w
+		JOIN market_items mi ON w.item_id = mi.id
+		LEFT JOIN latest_prices lp ON w.item_id = lp.item_id
+		WHERE w.user_id = $1
+		  AND (w.expires_at IS NULL OR w.expires_at > NOW())
+		ORDER BY w.created_at DESC
+	`
+	var watches []WatchWithItem
+	err := d.db.SelectContext(ctx, &watches, query, userID)
+	return watches, err
+}
+
+// GetActiveWatches retrieves all non-triggered watches for processing
+func (d *DB) GetActiveWatches(ctx context.Context) ([]Watch, error) {
+	query := `
+		SELECT id, user_id, item_id, watch_type, threshold, triggered, triggered_at, created_at, expires_at
+		FROM market_watches
+		WHERE triggered = FALSE
+		ORDER BY item_id
+	`
+	var watches []Watch
+	err := d.db.SelectContext(ctx, &watches, query)
+	return watches, err
+}
+
+// TriggerWatch marks a watch as triggered and sets expiration
+func (d *DB) TriggerWatch(ctx context.Context, watchID int) error {
+	query := `
+		UPDATE market_watches 
+		SET triggered = TRUE, 
+			triggered_at = NOW(), 
+			expires_at = NOW() + INTERVAL '24 hours'
+		WHERE id = $1
+	`
+	_, err := d.db.ExecContext(ctx, query, watchID)
+	return err
+}
+
+// DeleteWatch deletes a watch (only if owned by user)
+func (d *DB) DeleteWatch(ctx context.Context, watchID int, userID string) error {
+	query := `DELETE FROM market_watches WHERE id = $1 AND user_id = $2`
+	result, err := d.db.ExecContext(ctx, query, watchID, userID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// CleanupExpiredWatches removes watches that have expired (24h after trigger)
+func (d *DB) CleanupExpiredWatches(ctx context.Context) (int64, error) {
+	query := `DELETE FROM market_watches WHERE expires_at IS NOT NULL AND expires_at < NOW()`
+	result, err := d.db.ExecContext(ctx, query)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+// GetWatchCountByUser returns the number of active watches for a user
+func (d *DB) GetWatchCountByUser(ctx context.Context, userID string) (int, error) {
+	var count int
+	err := d.db.GetContext(ctx, &count, `
+		SELECT COUNT(*) FROM market_watches 
+		WHERE user_id = $1 AND triggered = FALSE
+	`, userID)
+	return count, err
+}
+
+// GetTradeVolumeCache retrieves cached trade volume data for an item
+func (d *DB) GetTradeVolumeCache(ctx context.Context, itemID int) (*TradeVolumeCache, error) {
+	var cache TradeVolumeCache
+	err := d.db.GetContext(ctx, &cache, `
+		SELECT item_id, trade_volume_1day, avg_price_1day, avg_price_7days, avg_price_30days, fetched_at
+		FROM market_trade_volume_cache
+		WHERE item_id = $1
+	`, itemID)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &cache, nil
+}
+
+// SaveTradeVolumeCache saves trade volume data to the cache
+func (d *DB) SaveTradeVolumeCache(ctx context.Context, cache *TradeVolumeCache) error {
+	query := `
+		INSERT INTO market_trade_volume_cache (item_id, trade_volume_1day, avg_price_1day, avg_price_7days, avg_price_30days, fetched_at)
+		VALUES ($1, $2, $3, $4, $5, NOW())
+		ON CONFLICT (item_id) DO UPDATE SET
+			trade_volume_1day = EXCLUDED.trade_volume_1day,
+			avg_price_1day = EXCLUDED.avg_price_1day,
+			avg_price_7days = EXCLUDED.avg_price_7days,
+			avg_price_30days = EXCLUDED.avg_price_30days,
+			fetched_at = NOW()
+	`
+	_, err := d.db.ExecContext(ctx, query, cache.ItemID, cache.TradeVolume1d, cache.AvgPrice1d, cache.AvgPrice7d, cache.AvgPrice30d)
+	return err
 }

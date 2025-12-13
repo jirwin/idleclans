@@ -91,6 +91,14 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering for SSE
+
+	// Check if response writer supports flushing
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "SSE not supported", http.StatusInternalServerError)
+		return
+	}
 
 	// Create client channel
 	client := make(chan string, 10)
@@ -108,12 +116,10 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	// Send initial connection event
 	fmt.Fprintf(w, "event: connected\ndata: {\"status\":\"connected\"}\n\n")
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
+	flusher.Flush()
 
-	// Keep-alive ticker (send ping every 30 seconds)
-	ticker := time.NewTicker(30 * time.Second)
+	// Keep-alive ticker (send ping every 15 seconds to prevent timeouts)
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -122,18 +128,20 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-ticker.C:
 			// Send keep-alive ping
-			fmt.Fprintf(w, ": ping\n\n")
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
+			_, err := fmt.Fprintf(w, ": ping\n\n")
+			if err != nil {
+				return // Client disconnected
 			}
+			flusher.Flush()
 		case msg, ok := <-client:
 			if !ok {
 				return
 			}
-			fmt.Fprintf(w, "event: update\ndata: {\"type\":\"%s\"}\n\n", msg)
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
+			_, err := fmt.Fprintf(w, "event: update\ndata: {\"type\":\"%s\"}\n\n", msg)
+			if err != nil {
+				return // Client disconnected
 			}
+			flusher.Flush()
 		}
 	}
 }

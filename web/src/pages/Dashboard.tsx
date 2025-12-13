@@ -72,7 +72,7 @@ export function Dashboard() {
 
   // Use SSE for live updates
   useSSE({
-    onUpdate: loadData,
+    onUpdate: () => loadData(),
     enabled: !loading,
   });
 
@@ -363,6 +363,13 @@ export function Dashboard() {
               className="hidden"
             />
             
+            <button
+              onClick={() => navigate('/market')}
+              className="p-2 text-white bg-gradient-to-r from-emerald-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 rounded-lg transition-all"
+              title="Market"
+            >
+              📈
+            </button>
             <button
               onClick={() => navigate('/clan')}
               className="p-2 text-white bg-gradient-to-r from-violet-600 to-purple-600 hover:from-violet-500 hover:to-purple-500 rounded-lg transition-all"

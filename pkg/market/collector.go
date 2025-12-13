@@ -25,6 +25,24 @@ const (
 	safeRequestsPer2Min = 35
 )
 
+// WatchNotifier is called when a market watch is triggered
+type WatchNotifier interface {
+	// NotifyWatchTriggered sends a notification when a watch threshold is met
+	NotifyWatchTriggered(ctx context.Context, watch *TriggeredWatch) error
+}
+
+// TriggeredWatch contains details about a triggered watch for notification
+type TriggeredWatch struct {
+	WatchID         int
+	UserID          string
+	ItemID          int
+	ItemNameID      string
+	ItemDisplayName string
+	WatchType       string // "buy" or "sell"
+	Threshold       int
+	CurrentPrice    int
+}
+
 // Collector fetches price data from the IdleClans API
 type Collector struct {
 	db        *DB
@@ -47,6 +65,12 @@ type Collector struct {
 	itemsMu          sync.RWMutex
 	items            map[int]string // id -> name_id
 	itemsLastRefresh time.Time      // when items were last fetched
+
+	// Watch notification callback
+	watchNotifier WatchNotifier
+
+	// Data change notification callback (for SSE)
+	dataChangeNotifier func(changeType string)
 }
 
 // CollectorConfig holds configuration for the collector
@@ -80,6 +104,16 @@ func NewCollector(db *DB, logger *zap.Logger, config *CollectorConfig) *Collecto
 		batchSize: config.BatchSize,
 		items:     make(map[int]string),
 	}
+}
+
+// SetWatchNotifier sets the callback for watch notifications
+func (c *Collector) SetWatchNotifier(notifier WatchNotifier) {
+	c.watchNotifier = notifier
+}
+
+// SetDataChangeNotifier sets the callback for SSE data change notifications
+func (c *Collector) SetDataChangeNotifier(notifier func(changeType string)) {
+	c.dataChangeNotifier = notifier
 }
 
 // Start begins the collection loop
@@ -215,6 +249,155 @@ func (c *Collector) collectBulkPrices(ctx context.Context) {
 			c.logger.Debug("Refreshed market overview cache", zap.Duration("duration", time.Since(cacheStart)))
 		}
 	}()
+
+	// Process market watches to check for triggered thresholds
+	go func() {
+		bgCtx := context.Background()
+		c.processWatches(bgCtx)
+	}()
+
+	// Notify SSE clients that market data has been updated
+	if c.dataChangeNotifier != nil {
+		c.dataChangeNotifier("market")
+	}
+}
+
+// processWatches checks all active watches against current prices and triggers notifications
+func (c *Collector) processWatches(ctx context.Context) {
+	// Clean up expired watches first
+	deleted, err := c.db.CleanupExpiredWatches(ctx)
+	if err != nil {
+		c.logger.Warn("Failed to cleanup expired watches", zap.Error(err))
+	} else if deleted > 0 {
+		c.logger.Info("Cleaned up expired watches", zap.Int64("count", deleted))
+	}
+
+	// Get all active (non-triggered) watches
+	watches, err := c.db.GetActiveWatches(ctx)
+	if err != nil {
+		c.logger.Error("Failed to get active watches", zap.Error(err))
+		return
+	}
+
+	if len(watches) == 0 {
+		return
+	}
+
+	// Collect unique item IDs from watches
+	itemIDSet := make(map[int]bool)
+	for _, w := range watches {
+		itemIDSet[w.ItemID] = true
+	}
+	itemIDs := make([]int, 0, len(itemIDSet))
+	for id := range itemIDSet {
+		itemIDs = append(itemIDs, id)
+	}
+
+	// Fetch latest prices for watched items
+	prices, err := c.db.GetLatestPrices(ctx, itemIDs)
+	if err != nil {
+		c.logger.Error("Failed to get latest prices for watches", zap.Error(err))
+		return
+	}
+
+	// Build price lookup map
+	priceMap := make(map[int]*PriceSnapshot)
+	for i := range prices {
+		priceMap[prices[i].ItemID] = &prices[i]
+	}
+
+	// Fetch item details for notifications
+	itemDetailsMap := make(map[int]*Item)
+	for _, itemID := range itemIDs {
+		item, err := c.db.GetItem(ctx, itemID)
+		if err == nil && item != nil {
+			itemDetailsMap[itemID] = item
+		}
+	}
+
+	// Check each watch against current prices
+	triggeredCount := 0
+	for _, watch := range watches {
+		price, ok := priceMap[watch.ItemID]
+		if !ok || price == nil {
+			continue
+		}
+
+		triggered := false
+		var currentPrice int
+
+		switch watch.WatchType {
+		case "buy":
+			// Buy watch triggers when highest_buy_price >= threshold
+			// (someone is buying at or above your target price)
+			if price.HighestBuyPrice > 0 && price.HighestBuyPrice >= watch.Threshold {
+				triggered = true
+				currentPrice = price.HighestBuyPrice
+			}
+		case "sell":
+			// Sell watch triggers when lowest_sell_price <= threshold
+			// (someone is selling at or below your target price)
+			if price.LowestSellPrice > 0 && price.LowestSellPrice <= watch.Threshold {
+				triggered = true
+				currentPrice = price.LowestSellPrice
+			}
+		}
+
+		if triggered {
+			// Mark watch as triggered
+			if err := c.db.TriggerWatch(ctx, watch.ID); err != nil {
+				c.logger.Error("Failed to trigger watch",
+					zap.Int("watch_id", watch.ID),
+					zap.Error(err))
+				continue
+			}
+
+			triggeredCount++
+
+			// Send notification if notifier is configured
+			if c.watchNotifier != nil {
+				item := itemDetailsMap[watch.ItemID]
+				itemNameID := ""
+				itemDisplayName := ""
+				if item != nil {
+					itemNameID = item.NameID
+					itemDisplayName = item.DisplayName
+				}
+
+				triggeredWatch := &TriggeredWatch{
+					WatchID:         watch.ID,
+					UserID:          watch.UserID,
+					ItemID:          watch.ItemID,
+					ItemNameID:      itemNameID,
+					ItemDisplayName: itemDisplayName,
+					WatchType:       watch.WatchType,
+					Threshold:       watch.Threshold,
+					CurrentPrice:    currentPrice,
+				}
+
+				if err := c.watchNotifier.NotifyWatchTriggered(ctx, triggeredWatch); err != nil {
+					c.logger.Error("Failed to send watch notification",
+						zap.Int("watch_id", watch.ID),
+						zap.String("user_id", watch.UserID),
+						zap.Error(err))
+				} else {
+					c.logger.Info("Watch triggered and notification sent",
+						zap.Int("watch_id", watch.ID),
+						zap.String("user_id", watch.UserID),
+						zap.String("item", itemDisplayName),
+						zap.String("type", watch.WatchType),
+						zap.Int("threshold", watch.Threshold),
+						zap.Int("current_price", currentPrice))
+				}
+			}
+		}
+	}
+
+	if triggeredCount > 0 {
+		c.logger.Info("Processed market watches",
+			zap.Int("total_watches", len(watches)),
+			zap.Int("triggered", triggeredCount))
+	}
 }
 
 // collectHistory backfills historical data for items (runs every 2 minutes)
@@ -850,6 +1033,68 @@ func (c *Collector) FetchPriceHistoryPeriod(ctx context.Context, itemID int, per
 // For backwards compatibility
 func (c *Collector) FetchPriceHistory(ctx context.Context, itemID int) ([]PriceHistoryEntry, error) {
 	return c.FetchPriceHistoryPeriod(ctx, itemID, "30d")
+}
+
+// ComprehensivePriceResponse represents the response from the comprehensive price endpoint
+type ComprehensivePriceResponse struct {
+	ItemID           int `json:"itemId"`
+	AveragePrice1Day  int `json:"averagePrice1Day"`
+	AveragePrice7Days int `json:"averagePrice7Days"`
+	AveragePrice30Days int `json:"averagePrice30Days"`
+	TradeVolume1Day   int `json:"tradeVolume1Day"`
+}
+
+// FetchComprehensivePrice fetches comprehensive price data including trade volume
+// This endpoint provides trade volume which is not available in the bulk endpoint
+func (c *Collector) FetchComprehensivePrice(ctx context.Context, itemID int) (*ComprehensivePriceResponse, error) {
+	// Check rate limit backoff
+	c.backoffMu.RLock()
+	if time.Now().Before(c.backoffUntil) {
+		c.backoffMu.RUnlock()
+		return nil, fmt.Errorf("rate limited, backing off until %v", c.backoffUntil)
+	}
+	c.backoffMu.RUnlock()
+
+	url := fmt.Sprintf("%s/PlayerMarket/items/prices/latest/comprehensive/%d", apiBaseURL, itemID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	c.logger.Info("Fetching comprehensive price data",
+		zap.Int("item_id", itemID),
+		zap.String("url", url))
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		c.setBackoff(5 * time.Minute)
+		return nil, fmt.Errorf("rate limited (429)")
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	}
+
+	// Successful request - clear backoff
+	c.clearBackoff()
+
+	var result ComprehensivePriceResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	c.logger.Info("Fetched comprehensive price data",
+		zap.Int("item_id", itemID),
+		zap.Int("trade_volume_1d", result.TradeVolume1Day),
+		zap.Int("avg_price_1d", result.AveragePrice1Day))
+
+	return &result, nil
 }
 
 // BackfillHistory fetches and stores historical price data for an item

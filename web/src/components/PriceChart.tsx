@@ -613,6 +613,14 @@ export function PriceChart({ itemId, timeRange }: PriceChartProps) {
                     })()}
                   </span>
                 </div>
+                <div className="flex justify-between gap-4 border-t border-gray-700 mt-1 pt-1">
+                  <span className="text-purple-400">Sell Vol:</span>
+                  <span>{(hoveredPoint.data as PriceSnapshot).lowest_price_volume?.toLocaleString() || '0'}</span>
+                </div>
+                <div className="flex justify-between gap-4">
+                  <span className="text-purple-400">Buy Vol:</span>
+                  <span>{(hoveredPoint.data as PriceSnapshot).highest_price_volume?.toLocaleString() || '0'}</span>
+                </div>
               </>
             )}
           </div>

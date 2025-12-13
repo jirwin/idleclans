@@ -19,12 +19,16 @@ func NewAnalytics(db *DB) *Analytics {
 
 // ItemSummary provides a summary of an item's market data
 type ItemSummary struct {
-	Item          *Item          `json:"item"`
-	CurrentPrice  *PriceSnapshot `json:"current_price"`
-	Change24h     *PriceChange24h `json:"change_24h"`
-	Volatility    float64        `json:"volatility"`
-	Spread        int            `json:"spread"`
-	SpreadPercent float64        `json:"spread_percent"`
+	Item           *Item             `json:"item"`
+	CurrentPrice   *PriceSnapshot    `json:"current_price"`
+	Change24h      *PriceChange24h   `json:"change_24h"`
+	Volatility     float64           `json:"volatility"`
+	Spread         int               `json:"spread"`
+	SpreadPercent  float64           `json:"spread_percent"`
+	TradeVolume1d  *int              `json:"trade_volume_1d,omitempty"`
+	AvgPrice1d     *int              `json:"avg_price_1d,omitempty"`
+	AvgPrice7d     *int              `json:"avg_price_7d,omitempty"`
+	AvgPrice30d    *int              `json:"avg_price_30d,omitempty"`
 }
 
 // PriceChange24h represents 24-hour price change data
@@ -64,6 +68,15 @@ func (a *Analytics) GetItemSummary(ctx context.Context, itemID int) (*ItemSummar
 
 		// Calculate volatility
 		summary.Volatility = a.calculateVolatility(ctx, itemID, 24*time.Hour)
+	}
+
+	// Get trade volume from cache if available
+	tradeVol, err := a.db.GetTradeVolumeCache(ctx, itemID)
+	if err == nil && tradeVol != nil {
+		summary.TradeVolume1d = tradeVol.TradeVolume1d
+		summary.AvgPrice1d = tradeVol.AvgPrice1d
+		summary.AvgPrice7d = tradeVol.AvgPrice7d
+		summary.AvgPrice30d = tradeVol.AvgPrice30d
 	}
 
 	return summary, nil

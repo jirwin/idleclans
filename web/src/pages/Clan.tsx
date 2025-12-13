@@ -202,12 +202,20 @@ export function Clan() {
               </p>
             </div>
           </div>
-          <button
-            onClick={() => navigate('/dashboard')}
-            className="px-4 py-2 text-sm text-gray-400 hover:text-white border border-gray-600 hover:border-gray-500 rounded-lg transition-colors"
-          >
-            My Quests
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => navigate('/market')}
+              className="px-4 py-2 text-sm text-gray-400 hover:text-white border border-gray-600 hover:border-gray-500 rounded-lg transition-colors"
+            >
+              Market
+            </button>
+            <button
+              onClick={() => navigate('/dashboard')}
+              className="px-4 py-2 text-sm text-gray-400 hover:text-white border border-gray-600 hover:border-gray-500 rounded-lg transition-colors"
+            >
+              My Quests
+            </button>
+          </div>
         </header>
 
         {/* User's Parties */}

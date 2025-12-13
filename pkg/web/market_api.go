@@ -13,10 +13,11 @@ import (
 
 // MarketAPI handles market-related API endpoints
 type MarketAPI struct {
-	db        *market.DB
-	analytics *market.Analytics
-	collector *market.Collector
-	logger    *zap.Logger
+	db                 *market.DB
+	analytics          *market.Analytics
+	collector          *market.Collector
+	logger             *zap.Logger
+	dataChangeNotifier func(changeType string)
 }
 
 // NewMarketAPI creates a new market API handler
@@ -27,6 +28,11 @@ func NewMarketAPI(db *market.DB, collector *market.Collector, logger *zap.Logger
 		collector: collector,
 		logger:    logger,
 	}
+}
+
+// SetDataChangeNotifier sets the callback for SSE notifications
+func (m *MarketAPI) SetDataChangeNotifier(notifier func(changeType string)) {
+	m.dataChangeNotifier = notifier
 }
 
 // handleMarketOverview returns a market overview with top movers
@@ -156,8 +162,69 @@ func (m *MarketAPI) handleGetItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if we need to refresh trade volume data
+	// Only fetch if cache is missing or older than 1 hour
+	m.refreshTradeVolumeIfNeeded(ctx, itemID, summary)
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(summary)
+}
+
+// refreshTradeVolumeIfNeeded fetches trade volume from the comprehensive API if cache is stale
+func (m *MarketAPI) refreshTradeVolumeIfNeeded(ctx context.Context, itemID int, summary *market.ItemSummary) {
+	// Check if we have cached data that's less than 1 hour old
+	cache, err := m.db.GetTradeVolumeCache(ctx, itemID)
+	if err == nil && cache != nil && time.Since(cache.FetchedAt) < time.Hour {
+		// Cache is fresh, data already populated by GetItemSummary
+		return
+	}
+
+	// Fetch fresh data from comprehensive API (in background to not block response)
+	go func() {
+		bgCtx := context.Background()
+		
+		comprehensive, err := m.collector.FetchComprehensivePrice(bgCtx, itemID)
+		if err != nil {
+			m.logger.Debug("Failed to fetch comprehensive price data",
+				zap.Int("item_id", itemID),
+				zap.Error(err))
+			return
+		}
+
+		// Save to cache
+		tradeVol := comprehensive.TradeVolume1Day
+		avgPrice1d := comprehensive.AveragePrice1Day
+		avgPrice7d := comprehensive.AveragePrice7Days
+		avgPrice30d := comprehensive.AveragePrice30Days
+		
+		newCache := &market.TradeVolumeCache{
+			ItemID:        itemID,
+			TradeVolume1d: &tradeVol,
+			AvgPrice1d:    &avgPrice1d,
+			AvgPrice7d:    &avgPrice7d,
+			AvgPrice30d:   &avgPrice30d,
+		}
+
+		if err := m.db.SaveTradeVolumeCache(bgCtx, newCache); err != nil {
+			m.logger.Warn("Failed to save trade volume cache",
+				zap.Int("item_id", itemID),
+				zap.Error(err))
+		} else {
+			// Notify via SSE that trade volume was updated for this item
+			if m.dataChangeNotifier != nil {
+				m.dataChangeNotifier("market:item:" + strconv.Itoa(itemID))
+			}
+		}
+	}()
+
+	// If we have stale cache data, use it for this response
+	// The fresh data will be available on next request
+	if cache != nil {
+		summary.TradeVolume1d = cache.TradeVolume1d
+		summary.AvgPrice1d = cache.AvgPrice1d
+		summary.AvgPrice7d = cache.AvgPrice7d
+		summary.AvgPrice30d = cache.AvgPrice30d
+	}
 }
 
 // handleGetItemByName returns a single item by name_id
@@ -188,6 +255,9 @@ func (m *MarketAPI) handleGetItemByName(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "Failed to get item", http.StatusInternalServerError)
 		return
 	}
+
+	// Check if we need to refresh trade volume data
+	m.refreshTradeVolumeIfNeeded(ctx, item.ID, summary)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(summary)
@@ -594,6 +664,140 @@ func (m *MarketAPI) handleTriggerBackfill(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// CreateWatchRequest represents a request to create a market watch
+type CreateWatchRequest struct {
+	ItemID    int    `json:"item_id"`
+	WatchType string `json:"watch_type"` // "buy" or "sell"
+	Threshold int    `json:"threshold"`
+}
+
+// handleCreateWatch creates a new market watch for the authenticated user
+func (m *MarketAPI) handleCreateWatch(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	session := getSession(r)
+	if session == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var req CreateWatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate request
+	if req.ItemID <= 0 {
+		http.Error(w, "Invalid item ID", http.StatusBadRequest)
+		return
+	}
+	if req.WatchType != "buy" && req.WatchType != "sell" {
+		http.Error(w, "Watch type must be 'buy' or 'sell'", http.StatusBadRequest)
+		return
+	}
+	if req.Threshold <= 0 {
+		http.Error(w, "Threshold must be positive", http.StatusBadRequest)
+		return
+	}
+
+	// Check if item exists
+	item, err := m.db.GetItem(ctx, req.ItemID)
+	if err != nil || item == nil {
+		http.Error(w, "Item not found", http.StatusNotFound)
+		return
+	}
+
+	// Check watch limit (max 10 active watches per user)
+	count, err := m.db.GetWatchCountByUser(ctx, session.UserID)
+	if err != nil {
+		m.logger.Error("Failed to get watch count", zap.Error(err))
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	if count >= 10 {
+		http.Error(w, "Maximum of 10 active watches allowed", http.StatusBadRequest)
+		return
+	}
+
+	// Create the watch
+	watch, err := m.db.CreateWatch(ctx, session.UserID, req.ItemID, req.WatchType, req.Threshold)
+	if err != nil {
+		m.logger.Error("Failed to create watch", zap.Error(err))
+		http.Error(w, "Failed to create watch", http.StatusInternalServerError)
+		return
+	}
+
+	m.logger.Info("Market watch created",
+		zap.Int("watch_id", watch.ID),
+		zap.String("user_id", session.UserID),
+		zap.Int("item_id", req.ItemID),
+		zap.String("type", req.WatchType),
+		zap.Int("threshold", req.Threshold))
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(watch)
+}
+
+// handleGetWatches returns all watches for the authenticated user
+func (m *MarketAPI) handleGetWatches(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	session := getSession(r)
+	if session == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	watches, err := m.db.GetWatchesByUser(ctx, session.UserID)
+	if err != nil {
+		m.logger.Error("Failed to get watches", zap.Error(err), zap.String("user_id", session.UserID))
+		http.Error(w, "Failed to get watches", http.StatusInternalServerError)
+		return
+	}
+
+	// Ensure we return an empty array, not null
+	if watches == nil {
+		watches = []market.WatchWithItem{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(watches)
+}
+
+// handleDeleteWatch deletes a watch owned by the authenticated user
+func (m *MarketAPI) handleDeleteWatch(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	session := getSession(r)
+	if session == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	watchIDStr := r.PathValue("watchId")
+	watchID, err := strconv.Atoi(watchIDStr)
+	if err != nil {
+		http.Error(w, "Invalid watch ID", http.StatusBadRequest)
+		return
+	}
+
+	err = m.db.DeleteWatch(ctx, watchID, session.UserID)
+	if err != nil {
+		if err.Error() == "sql: no rows in result set" {
+			http.Error(w, "Watch not found", http.StatusNotFound)
+			return
+		}
+		m.logger.Error("Failed to delete watch", zap.Error(err), zap.Int("watch_id", watchID))
+		http.Error(w, "Failed to delete watch", http.StatusInternalServerError)
+		return
+	}
+
+	m.logger.Info("Market watch deleted",
+		zap.Int("watch_id", watchID),
+		zap.String("user_id", session.UserID))
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // RegisterMarketRoutes registers all market API routes
 func (m *MarketAPI) RegisterRoutes(mux *http.ServeMux, prefix string) {
 	// Market overview
@@ -624,5 +828,14 @@ func (m *MarketAPI) RegisterRoutes(mux *http.ServeMux, prefix string) {
 	// Top movers
 	mux.HandleFunc("GET "+prefix+"/movers", m.handleGetTopMovers)
 	mux.HandleFunc("GET "+prefix+"/most-traded", m.handleGetMostTraded)
+}
+
+// RegisterAuthenticatedRoutes registers market routes that require authentication
+// This should be called by the Server to wrap handlers with withAuth
+func (m *MarketAPI) RegisterAuthenticatedRoutes(mux *http.ServeMux, prefix string, withAuth func(http.HandlerFunc) http.HandlerFunc) {
+	// Watch endpoints (require authentication)
+	mux.HandleFunc("POST "+prefix+"/watches", withAuth(m.handleCreateWatch))
+	mux.HandleFunc("GET "+prefix+"/watches", withAuth(m.handleGetWatches))
+	mux.HandleFunc("DELETE "+prefix+"/watches/{watchId}", withAuth(m.handleDeleteWatch))
 }
 

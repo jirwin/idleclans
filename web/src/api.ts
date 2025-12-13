@@ -575,6 +575,10 @@ export interface ItemSummary {
   volatility: number;
   spread: number;
   spread_percent: number;
+  trade_volume_1d?: number;
+  avg_price_1d?: number;
+  avg_price_7d?: number;
+  avg_price_30d?: number;
 }
 
 export interface PriceChange {
@@ -807,5 +811,91 @@ export async function fetchVolumeAnalysis(itemId: number): Promise<VolumeAnalysi
     throw new Error(`Failed to fetch volume analysis: ${res.statusText}`);
   }
   return res.json();
+}
+
+// Market Watch API functions
+
+export interface MarketWatch {
+  id: number;
+  user_id: string;
+  item_id: number;
+  watch_type: 'buy' | 'sell';
+  threshold: number;
+  triggered: boolean;
+  triggered_at?: string;
+  created_at: string;
+  expires_at?: string;
+}
+
+export interface MarketWatchWithItem extends MarketWatch {
+  item_name_id: string;
+  item_display_name: string;
+  current_buy_price: number;
+  current_sell_price: number;
+}
+
+export async function createMarketWatch(
+  itemId: number,
+  watchType: 'buy' | 'sell',
+  threshold: number
+): Promise<MarketWatch> {
+  const res = await fetch(`${MARKET_API_BASE}/watches`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({
+      item_id: itemId,
+      watch_type: watchType,
+      threshold: threshold,
+    }),
+  });
+
+  if (res.status === 401) {
+    throw new Error('Unauthorized');
+  }
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `Failed to create watch: ${res.statusText}`);
+  }
+
+  return res.json();
+}
+
+export async function fetchMarketWatches(): Promise<MarketWatchWithItem[]> {
+  const res = await fetch(`${MARKET_API_BASE}/watches`, {
+    credentials: 'include',
+  });
+
+  if (res.status === 401) {
+    throw new Error('Unauthorized');
+  }
+
+  if (!res.ok) {
+    throw new Error(`Failed to fetch watches: ${res.statusText}`);
+  }
+
+  const data = await res.json();
+  // Ensure we always return an array even if API returns null
+  return data ?? [];
+}
+
+export async function deleteMarketWatch(watchId: number): Promise<void> {
+  const res = await fetch(`${MARKET_API_BASE}/watches/${watchId}`, {
+    method: 'DELETE',
+    credentials: 'include',
+  });
+
+  if (res.status === 401) {
+    throw new Error('Unauthorized');
+  }
+
+  if (res.status === 404) {
+    throw new Error('Watch not found');
+  }
+
+  if (!res.ok) {
+    throw new Error(`Failed to delete watch: ${res.statusText}`);
+  }
 }
 
