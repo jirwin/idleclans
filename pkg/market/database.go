@@ -735,11 +735,14 @@ func (d *DB) getPriceHistoryBucketedCombined(ctx context.Context, itemID int, fr
 			SELECT 
 				time_bucket('%d minutes', time) as bucket_time,
 				item_id,
-				first(lowest_sell_price, time) as open_price,
-				last(lowest_sell_price, time) as close_price,
-				max(lowest_sell_price) as high_price,
-				min(NULLIF(lowest_sell_price, 0)) as low_price,
-				sum(lowest_price_volume) as total_volume
+				first(lowest_sell_price, time) as open_sell_price,
+				last(lowest_sell_price, time) as close_sell_price,
+				max(lowest_sell_price) as high_sell_price,
+				min(NULLIF(lowest_sell_price, 0)) as low_sell_price,
+				first(highest_buy_price, time) as open_buy_price,
+				last(highest_buy_price, time) as close_buy_price,
+				sum(lowest_price_volume) as total_sell_volume,
+				sum(highest_price_volume) as total_buy_volume
 			FROM combined
 			WHERE lowest_sell_price > 0
 			GROUP BY bucket_time, item_id
@@ -747,10 +750,10 @@ func (d *DB) getPriceHistoryBucketedCombined(ctx context.Context, itemID int, fr
 		SELECT 
 			bucket_time as time,
 			item_id,
-			COALESCE(close_price, 0) as lowest_sell_price,
-			COALESCE(total_volume, 0)::integer as lowest_price_volume,
-			COALESCE(close_price, 0) as highest_buy_price,
-			0 as highest_price_volume
+			COALESCE(close_sell_price, 0) as lowest_sell_price,
+			COALESCE(total_sell_volume, 0)::integer as lowest_price_volume,
+			COALESCE(close_buy_price, 0) as highest_buy_price,
+			COALESCE(total_buy_volume, 0)::integer as highest_price_volume
 		FROM bucketed
 		ORDER BY bucket_time ASC
 		LIMIT $4
@@ -1361,7 +1364,7 @@ func (d *DB) GetMostTradedOptimized(ctx context.Context, limit int) ([]PriceChan
 		  AND mp.lowest_price_volume > 0
 		ORDER BY mp.item_id, mp.time DESC
 	`
-	
+
 	// First get distinct items, then sort by volume
 	wrapperQuery := fmt.Sprintf(`
 		WITH latest_volumes AS (%s)
@@ -1369,7 +1372,7 @@ func (d *DB) GetMostTradedOptimized(ctx context.Context, limit int) ([]PriceChan
 		ORDER BY volume DESC
 		LIMIT $1
 	`, query)
-	
+
 	err := d.db.SelectContext(ctx, &results, wrapperQuery, limit)
 	return results, err
 }
